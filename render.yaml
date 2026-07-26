@@ -3,6 +3,7 @@ services:
     name: tg-teach-bot
     runtime: python
     plan: free
+    autoDeployTrigger: commit
     buildCommand: pip install -r requirements.txt
     startCommand: python mathbot.py
     envVars:
