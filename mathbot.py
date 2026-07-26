@@ -14,6 +14,8 @@ from telegram.ext import (
     filters,
 )
 
+import database
+
 
 def load_bot_token() -> str:
     """Load the Telegram bot token from the environment or a local file."""
@@ -141,6 +143,9 @@ def set_new_task(
 
     context.user_data["answer"] = answer
     context.user_data["task_id"] = task_id
+    context.user_data["task_expression"] = expr
+    context.user_data["task_level"] = level + 1
+    context.user_data["task_choice_count"] = choice_count
     context.user_data.pop("last_wrong_emoji", None)
     choices = generate_choices(answer, choice_count)
 
@@ -163,9 +168,6 @@ async def send_new_task(
 async def celebrate_correct(
     message, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    context.user_data["correct_count"] = (
-        context.user_data.get("correct_count", 0) + 1
-    )
     await message.reply_text(random.choice(CORRECT_EMOJIS))
     await send_new_task(message, context, "Готовий до наступного?")
 
@@ -174,9 +176,52 @@ async def encourage_retry(message) -> None:
     await message.reply_text(random.choice(WRONG_EMOJIS))
 
 
+async def save_answer(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    selected_answer: int,
+) -> bool:
+    correct_answer = context.user_data["answer"]
+    is_correct = selected_answer == correct_answer
+
+    if database.is_enabled():
+        try:
+            correct_count = await database.record_answer(
+                user=user,
+                expression=context.user_data["task_expression"],
+                selected_answer=selected_answer,
+                correct_answer=correct_answer,
+                difficulty_level=context.user_data["task_level"],
+                answer_options=context.user_data["task_choice_count"],
+            )
+            context.user_data["correct_count"] = correct_count
+            return is_correct
+        except Exception:
+            logging.exception(
+                "Could not save answer to PostgreSQL; using memory fallback"
+            )
+
+    if is_correct:
+        context.user_data["correct_count"] = (
+            context.user_data.get("correct_count", 0) + 1
+        )
+
+    return is_correct
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
-    context.user_data["correct_count"] = 0
+    try:
+        correct_count = await database.get_correct_count(
+            update.effective_user
+        )
+    except Exception:
+        logging.exception(
+            "Could not load progress from PostgreSQL; starting in memory"
+        )
+        correct_count = 0
+
+    context.user_data["correct_count"] = correct_count
     await update.message.reply_text(
         "Почнімо! Розв’язуй у своєму темпі — кількість спроб не обмежена.\n"
         "Обирай відповідь кнопкою. Якщо захочеш інший приклад, напиши /skip."
@@ -214,9 +259,11 @@ async def handle_message(
         return
 
     user_answer = int(text)
-    correct = context.user_data["answer"]
+    is_correct = await save_answer(
+        update.effective_user, context, user_answer
+    )
 
-    if user_answer == correct:
+    if is_correct:
         await celebrate_correct(update.message, context)
         return
 
@@ -237,7 +284,11 @@ async def handle_answer_button(
 
     await query.answer()
 
-    if selected_answer == context.user_data["answer"]:
+    is_correct = await save_answer(
+        query.from_user, context, selected_answer
+    )
+
+    if is_correct:
         await query.edit_message_reply_markup(reply_markup=None)
         await celebrate_correct(query.message, context)
         return
@@ -255,7 +306,13 @@ async def handle_answer_button(
 
 def main() -> None:
     bot_token = load_bot_token()
-    app = Application.builder().token(bot_token).build()
+    app = (
+        Application.builder()
+        .token(bot_token)
+        .post_init(database.connect_database)
+        .post_shutdown(database.close_database)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("skip", skip_task))
     app.add_handler(
