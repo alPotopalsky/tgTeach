@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import random
@@ -117,12 +118,30 @@ async def handle_message(
 
 
 def main() -> None:
-    app = Application.builder().token(load_bot_token()).build()
+    bot_token = load_bot_token()
+    app = Application.builder().token(bot_token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
-    app.run_polling()
+
+    external_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_URL")
+    if external_url:
+        webhook_path = "telegram"
+        webhook_secret = hashlib.sha256(bot_token.encode()).hexdigest()
+        port = int(os.getenv("PORT", "10000"))
+
+        logging.info("Starting webhook server on port %s", port)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=f"{external_url.rstrip('/')}/{webhook_path}",
+            secret_token=webhook_secret,
+        )
+    else:
+        logging.info("Starting bot in polling mode")
+        app.run_polling()
 
 
 if __name__ == "__main__":
