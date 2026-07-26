@@ -3,6 +3,7 @@ import logging
 import os
 import random
 from pathlib import Path
+from time import monotonic
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -155,14 +156,12 @@ def set_new_task(
 async def send_new_task(
     message, context: ContextTypes.DEFAULT_TYPE, prefix: str = ""
 ) -> None:
-    expr, keyboard, level, choice_count = set_new_task(context)
+    expr, keyboard, _, _ = set_new_task(context)
     heading = f"{prefix}\n\n" if prefix else ""
-    task_text = (
-        f"{heading}{expr} = ?\n\n"
-        f"Рівень {level} · варіантів: {choice_count}"
-    )
+    task_text = f"{heading}{expr} = ?"
     context.user_data["task_text"] = task_text
     await message.reply_text(task_text, reply_markup=keyboard)
+    context.user_data["task_started_at"] = monotonic()
 
 
 async def celebrate_correct(
@@ -183,6 +182,10 @@ async def save_answer(
 ) -> bool:
     correct_answer = context.user_data["answer"]
     is_correct = selected_answer == correct_answer
+    answered_at = monotonic()
+    started_at = context.user_data.get("task_started_at", answered_at)
+    response_time_ms = max(0, round((answered_at - started_at) * 1000))
+    context.user_data["task_started_at"] = answered_at
 
     if database.is_enabled():
         try:
@@ -193,6 +196,7 @@ async def save_answer(
                 correct_answer=correct_answer,
                 difficulty_level=context.user_data["task_level"],
                 answer_options=context.user_data["task_choice_count"],
+                response_time_ms=response_time_ms,
             )
             context.user_data["correct_count"] = correct_count
             return is_correct

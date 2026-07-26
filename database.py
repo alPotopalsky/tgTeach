@@ -37,8 +37,13 @@ CREATE_TABLES = [
         is_correct BOOLEAN NOT NULL,
         difficulty_level SMALLINT NOT NULL,
         answer_options SMALLINT NOT NULL,
+        response_time_ms INTEGER,
         answered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+    """,
+    """
+    ALTER TABLE answer_events
+    ADD COLUMN IF NOT EXISTS response_time_ms INTEGER
     """,
     """
     CREATE INDEX IF NOT EXISTS answer_events_user_time_idx
@@ -138,6 +143,7 @@ async def record_answer(
     correct_answer: int,
     difficulty_level: int,
     answer_options: int,
+    response_time_ms: int,
 ) -> int:
     if _pool is None:
         raise RuntimeError("Database is not connected")
@@ -157,9 +163,10 @@ async def record_answer(
                     correct_answer,
                     is_correct,
                     difficulty_level,
-                    answer_options
+                    answer_options,
+                    response_time_ms
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     user.id,
@@ -169,6 +176,7 @@ async def record_answer(
                     is_correct,
                     difficulty_level,
                     answer_options,
+                    response_time_ms,
                 ),
             )
             cursor = await connection.execute(
