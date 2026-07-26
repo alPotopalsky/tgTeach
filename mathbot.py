@@ -35,24 +35,6 @@ logging.basicConfig(level=logging.INFO)
 CORRECT_EMOJIS = ["🎉", "🥳", "🤩", "🏆", "🚀", "🌟"]
 WRONG_EMOJIS = ["😅", "🙈", "🤔", "🫠", "🥲", "🧐"]
 
-CORRECT_MESSAGES = [
-    "Точно! Чудова робота!",
-    "Правильно! Ти молодець!",
-    "Є! Відповідь правильна!",
-    "Супер! Так тримати!",
-    "Блискуче! Рахуєш упевнено!",
-    "Так! Ще одна маленька перемога!",
-]
-
-TRY_AGAIN_MESSAGES = [
-    "Майже! Спробуй ще раз — у тебе вийде.",
-    "Нічого страшного, помилки допомагають вчитися. Ще одна спроба?",
-    "Цей приклад вирішив трохи повередувати. Спробуймо ще раз!",
-    "Не здавайся — ти вже на шляху до правильної відповіді.",
-    "Хмм, не зовсім. Перевір обчислення і спробуй іще раз.",
-    "Усе гаразд! Можна пробувати стільки разів, скільки потрібно.",
-]
-
 
 def generate_task(level: int = 0) -> tuple[str, int]:
     if level == 0:
@@ -159,6 +141,7 @@ def set_new_task(
 
     context.user_data["answer"] = answer
     context.user_data["task_id"] = task_id
+    context.user_data.pop("last_wrong_emoji", None)
     choices = generate_choices(answer, choice_count)
 
     return expr, answer_keyboard(choices, task_id), level + 1, choice_count
@@ -169,11 +152,12 @@ async def send_new_task(
 ) -> None:
     expr, keyboard, level, choice_count = set_new_task(context)
     heading = f"{prefix}\n\n" if prefix else ""
-    await message.reply_text(
+    task_text = (
         f"{heading}{expr} = ?\n\n"
-        f"Рівень {level} · варіантів: {choice_count}",
-        reply_markup=keyboard,
+        f"Рівень {level} · варіантів: {choice_count}"
     )
+    context.user_data["task_text"] = task_text
+    await message.reply_text(task_text, reply_markup=keyboard)
 
 
 async def celebrate_correct(
@@ -183,13 +167,11 @@ async def celebrate_correct(
         context.user_data.get("correct_count", 0) + 1
     )
     await message.reply_text(random.choice(CORRECT_EMOJIS))
-    await message.reply_text(random.choice(CORRECT_MESSAGES))
     await send_new_task(message, context, "Готовий до наступного?")
 
 
 async def encourage_retry(message) -> None:
     await message.reply_text(random.choice(WRONG_EMOJIS))
-    await message.reply_text(random.choice(TRY_AGAIN_MESSAGES))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -260,7 +242,15 @@ async def handle_answer_button(
         await celebrate_correct(query.message, context)
         return
 
-    await encourage_retry(query.message)
+    previous_emoji = context.user_data.get("last_wrong_emoji")
+    emoji = random.choice(
+        [item for item in WRONG_EMOJIS if item != previous_emoji]
+    )
+    context.user_data["last_wrong_emoji"] = emoji
+    await query.edit_message_text(
+        f"{context.user_data['task_text']}\n\n{emoji}",
+        reply_markup=query.message.reply_markup,
+    )
 
 
 def main() -> None:
