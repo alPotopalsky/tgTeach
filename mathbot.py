@@ -38,8 +38,8 @@ logging.basicConfig(level=logging.INFO)
 CORRECT_EMOJIS = ["🎉", "🥳", "🤩", "🏆", "🚀", "🌟"]
 WRONG_EMOJIS = ["😅", "🙈", "🤔", "🫠", "🥲", "🧐"]
 
-MATH_LEVEL_COUNT = database.MATH_LEVEL_COUNT
-ENGLISH_LEVEL_COUNT = database.ENGLISH_LEVEL_COUNT
+MATH_LEVEL_COUNT = database.LEVEL_COUNT
+ENGLISH_LEVEL_COUNT = database.LEVEL_COUNT
 
 ENGLISH_WORDS = [
     (0, "cat", "кіт"),
@@ -273,29 +273,35 @@ def answer_keyboard(
 
 def set_new_task(
     context: ContextTypes.DEFAULT_TYPE,
-) -> tuple[str, InlineKeyboardMarkup, int, int]:
+) -> tuple[str, InlineKeyboardMarkup, int, int, int | None]:
     task_id = context.user_data.get("task_id", 0) + 1
     task_number = context.user_data.get("task_number", 0) + 1
-    english_level = min(
-        context.user_data.get("english_level", 0),
-        ENGLISH_LEVEL_COUNT - 1,
+    progress = {
+        "subjects": context.user_data.setdefault("subjects", {})
+    }
+    english_progress = database.get_subject_progress(progress, "english")
+    math_progress = database.get_subject_progress(progress, "math")
+    english_level = max(
+        1,
+        min(english_progress["level"], ENGLISH_LEVEL_COUNT),
     )
-    math_level = min(
-        context.user_data.get("math_level", 0),
-        MATH_LEVEL_COUNT - 1,
+    math_level = max(
+        1,
+        min(math_progress["level"], MATH_LEVEL_COUNT),
     )
-    english_interval = max(3, 5 - min(english_level // 3, 2))
+    english_interval = max(3, 5 - min((english_level - 1) // 3, 2))
 
     if task_number % english_interval == 0:
-        choice_count = min(3 + english_level // 3, 6)
+        choice_count = min(3 + (english_level - 1) // 3, 6)
         question, answer, choices = generate_english_task(
-            english_level, choice_count
+            english_level - 1, choice_count
         )
-        question_type = "english"
-        task_level = english_level + 1
+        subject = "english"
+        task_level = english_level
+        subject_progress = english_progress
     else:
-        choice_count = min(3 + math_level // 3, 6)
-        expression, numeric_answer = generate_task(math_level)
+        choice_count = min(3 + (math_level - 1) // 3, 6)
+        expression, numeric_answer = generate_task(math_level - 1)
         question = f"{expression} = ?"
         answer = str(numeric_answer)
         choices = [
@@ -303,41 +309,55 @@ def set_new_task(
             for choice in generate_choices(numeric_answer, choice_count)
         ]
 
-        question_type = "math"
-        task_level = math_level + 1
+        subject = "math"
+        task_level = math_level
+        subject_progress = math_progress
 
     context.user_data["answer"] = answer.casefold()
     context.user_data["task_id"] = task_id
     context.user_data["task_number"] = task_number
     context.user_data["task_expression"] = question
-    context.user_data["task_type"] = question_type
+    context.user_data["task_type"] = subject
     context.user_data["task_level"] = task_level
     context.user_data["task_choice_count"] = choice_count
+    context.user_data["task_attempts"] = 0
     context.user_data.pop("last_wrong_emoji", None)
+    bonus_target = database.bonus_target_seconds(subject_progress)
 
     return (
         question,
         answer_keyboard(choices, task_id),
         task_level,
         choice_count,
+        bonus_target,
     )
 
 
 async def send_new_task(
     message, context: ContextTypes.DEFAULT_TYPE, prefix: str = ""
 ) -> None:
-    question, keyboard, _, _ = set_new_task(context)
+    question, keyboard, _, _, bonus_target = set_new_task(context)
     heading = f"{prefix}\n\n" if prefix else ""
-    task_text = f"{heading}{question}"
+    bonus_text = ""
+    if bonus_target is not None:
+        bonus_text = (
+            "\n\n"
+            f"⚡ Бонус за правильну відповідь з першої спроби "
+            f"до {bonus_target} с!"
+        )
+    task_text = f"{heading}{question}{bonus_text}"
     context.user_data["task_text"] = task_text
     await message.reply_text(task_text, reply_markup=keyboard)
     context.user_data["task_started_at"] = monotonic()
 
 
 async def celebrate_correct(
-    message, context: ContextTypes.DEFAULT_TYPE
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    earned_bonus: bool = False,
 ) -> None:
-    await message.reply_text(random.choice(CORRECT_EMOJIS))
+    emoji = "⚡🌟" if earned_bonus else random.choice(CORRECT_EMOJIS)
+    await message.reply_text(emoji)
     await send_new_task(message, context, "Рухаємося далі:")
 
 
@@ -349,45 +369,53 @@ async def save_answer(
     user,
     context: ContextTypes.DEFAULT_TYPE,
     selected_answer: str,
-) -> bool:
+) -> tuple[bool, dict]:
     selected_answer = selected_answer.strip().casefold()
     correct_answer = context.user_data["answer"]
     is_correct = selected_answer == correct_answer
     answered_at = monotonic()
     started_at = context.user_data.get("task_started_at", answered_at)
     response_time_ms = max(0, round((answered_at - started_at) * 1000))
-    context.user_data["task_started_at"] = answered_at
+    attempts = context.user_data.get("task_attempts", 0)
+    first_attempt = attempts == 0
+    context.user_data["task_attempts"] = attempts + 1
 
     if database.is_enabled():
         try:
-            progress = await database.record_answer(
+            progress, event = await database.record_answer(
                 user=user,
+                task_id=context.user_data["task_id"],
                 expression=context.user_data["task_expression"],
                 selected_answer=selected_answer,
                 correct_answer=correct_answer,
-                question_type=context.user_data["task_type"],
+                subject=context.user_data["task_type"],
                 difficulty_level=context.user_data["task_level"],
                 answer_options=context.user_data["task_choice_count"],
                 response_time_ms=response_time_ms,
+                first_attempt=first_attempt,
             )
-            context.user_data.update(progress)
-            return is_correct
+            context.user_data["subjects"] = progress["subjects"]
+            return is_correct, event
         except Exception:
             logging.exception(
                 "Could not save answer to PostgreSQL; using memory fallback"
             )
 
     progress = {
-        key: context.user_data.get(key, value)
-        for key, value in database.empty_progress().items()
-    }
-    context.user_data.update(
-        database.advance_progress(
-            progress, context.user_data["task_type"], is_correct
+        "subjects": context.user_data.get(
+            "subjects", database.empty_progress()["subjects"]
         )
+    }
+    progress, event = database.apply_answer_to_progress(
+        progress,
+        context.user_data["task_type"],
+        is_correct,
+        response_time_ms,
+        first_attempt,
     )
+    context.user_data["subjects"] = progress["subjects"]
 
-    return is_correct
+    return is_correct, event
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -440,12 +468,14 @@ async def handle_message(
         await update.message.reply_text("Введи число 😊")
         return
 
-    is_correct = await save_answer(
+    is_correct, event = await save_answer(
         update.effective_user, context, text
     )
 
     if is_correct:
-        await celebrate_correct(update.message, context)
+        await celebrate_correct(
+            update.message, context, event["earned_bonus"]
+        )
         return
 
     await encourage_retry(update.message)
@@ -465,13 +495,15 @@ async def handle_answer_button(
 
     await query.answer()
 
-    is_correct = await save_answer(
+    is_correct, event = await save_answer(
         query.from_user, context, selected_answer
     )
 
     if is_correct:
         await query.edit_message_reply_markup(reply_markup=None)
-        await celebrate_correct(query.message, context)
+        await celebrate_correct(
+            query.message, context, event["earned_bonus"]
+        )
         return
 
     previous_emoji = context.user_data.get("last_wrong_emoji")
