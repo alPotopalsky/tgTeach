@@ -38,18 +38,106 @@ logging.basicConfig(level=logging.INFO)
 CORRECT_EMOJIS = ["🎉", "🥳", "🤩", "🏆", "🚀", "🌟"]
 WRONG_EMOJIS = ["😅", "🙈", "🤔", "🫠", "🥲", "🧐"]
 
+MATH_LEVEL_COUNT = database.MATH_LEVEL_COUNT
+ENGLISH_LEVEL_COUNT = database.ENGLISH_LEVEL_COUNT
+
+ENGLISH_WORDS = [
+    (0, "cat", "кіт"),
+    (0, "dog", "собака"),
+    (0, "sun", "сонце"),
+    (0, "book", "книга"),
+    (0, "apple", "яблуко"),
+    (0, "water", "вода"),
+    (0, "house", "будинок"),
+    (0, "tree", "дерево"),
+    (1, "school", "школа"),
+    (1, "window", "вікно"),
+    (1, "garden", "сад"),
+    (1, "morning", "ранок"),
+    (1, "family", "родина"),
+    (1, "picture", "малюнок"),
+    (1, "chair", "стілець"),
+    (1, "bread", "хліб"),
+    (2, "red", "червоний"),
+    (2, "blue", "синій"),
+    (2, "green", "зелений"),
+    (2, "yellow", "жовтий"),
+    (2, "white", "білий"),
+    (2, "black", "чорний"),
+    (3, "hand", "рука"),
+    (3, "head", "голова"),
+    (3, "eye", "око"),
+    (3, "milk", "молоко"),
+    (3, "cheese", "сир"),
+    (3, "soup", "суп"),
+    (4, "river", "річка"),
+    (4, "forest", "ліс"),
+    (4, "rain", "дощ"),
+    (4, "snow", "сніг"),
+    (4, "day", "день"),
+    (4, "night", "ніч"),
+    (5, "run", "бігти"),
+    (5, "read", "читати"),
+    (5, "write", "писати"),
+    (5, "speak", "говорити"),
+    (5, "listen", "слухати"),
+    (5, "play", "грати"),
+    (6, "big", "великий"),
+    (6, "small", "маленький"),
+    (6, "fast", "швидкий"),
+    (6, "slow", "повільний"),
+    (6, "warm", "теплий"),
+    (6, "cold", "холодний"),
+    (7, "street", "вулиця"),
+    (7, "city", "місто"),
+    (7, "bus", "автобус"),
+    (7, "train", "потяг"),
+    (7, "ticket", "квиток"),
+    (7, "journey", "подорож"),
+    (8, "question", "питання"),
+    (8, "answer", "відповідь"),
+    (8, "choice", "вибір"),
+    (8, "language", "мова"),
+    (8, "knowledge", "знання"),
+    (8, "success", "успіх"),
+    (9, "future", "майбутнє"),
+    (9, "courage", "сміливість"),
+    (9, "memory", "пам’ять"),
+    (9, "freedom", "свобода"),
+    (9, "health", "здоров’я"),
+    (9, "science", "наука"),
+]
+
 
 def generate_task(level: int = 0) -> tuple[str, int]:
     if level == 0:
-        mode = random.choice(["add1", "sub1"])
+        mode = "add_tiny"
     elif level == 1:
-        mode = random.choice(["add2_small", "sub2_small", "mul_easy"])
+        mode = random.choice(["add1", "sub1"])
     elif level == 2:
+        mode = random.choice(["add2_small", "sub2_small"])
+    elif level == 3:
+        mode = random.choice(["add2_small", "sub2_small", "mul_tiny"])
+    elif level == 4:
+        mode = random.choice(["add2", "sub2", "mul_easy"])
+    elif level == 5:
         mode = random.choice(["add2", "sub2", "mul"])
-    else:
+    elif level == 6:
+        mode = random.choice(["add2", "sub2", "mul", "div_easy"])
+    elif level == 7:
         mode = random.choice(["add3", "sub3", "mul"])
+    elif level == 8:
+        mode = random.choice(["add3", "sub3", "mul_large", "div_large"])
+    else:
+        mode = random.choice(
+            ["add_large", "sub_large", "mul_large", "div_large"]
+        )
 
-    if mode == "add1":
+    if mode == "add_tiny":
+        a, b = random.randint(1, 5), random.randint(1, 5)
+        operator = "+"
+        answer = a + b
+    elif mode == "add1":
         a, b = random.randint(2, 10), random.randint(2, 10)
         operator = "+"
         answer = a + b
@@ -73,6 +161,10 @@ def generate_task(level: int = 0) -> tuple[str, int]:
         a, b = random.randint(2, 10), random.randint(2, 10)
         operator = "×"
         answer = a * b
+    elif mode == "mul_tiny":
+        a, b = random.randint(2, 5), random.randint(2, 5)
+        operator = "×"
+        answer = a * b
     elif mode == "add2":
         a, b = random.randint(10, 99), random.randint(10, 99)
         operator = "+"
@@ -93,6 +185,31 @@ def generate_task(level: int = 0) -> tuple[str, int]:
         )
         operator = "-"
         answer = a - b
+    elif mode == "add_large":
+        a, b = random.randint(300, 999), random.randint(300, 999)
+        operator = "+"
+        answer = a + b
+    elif mode == "sub_large":
+        a, b = sorted(
+            [random.randint(300, 999), random.randint(300, 999)],
+            reverse=True,
+        )
+        operator = "-"
+        answer = a - b
+    elif mode == "mul_large":
+        a, b = random.randint(10, 20), random.randint(10, 20)
+        operator = "×"
+        answer = a * b
+    elif mode == "div_easy":
+        divisor = random.randint(2, 10)
+        answer = random.randint(2, 10)
+        a, b = divisor * answer, divisor
+        operator = "÷"
+    elif mode == "div_large":
+        divisor = random.randint(10, 20)
+        answer = random.randint(2, 15)
+        a, b = divisor * answer, divisor
+        operator = "÷"
     else:
         a, b = random.randint(2, 15), random.randint(2, 15)
         operator = "×"
@@ -116,8 +233,29 @@ def generate_choices(answer: int, count: int) -> list[int]:
     return result
 
 
+def generate_english_task(
+    level: int, choice_count: int
+) -> tuple[str, str, list[str]]:
+    available_words = [word for word in ENGLISH_WORDS if word[0] == level]
+    _, english_word, correct_translation = random.choice(available_words)
+    distractors = [
+        translation
+        for _, _, translation in available_words
+        if translation != correct_translation
+    ]
+    choices = random.sample(distractors, choice_count - 1)
+    choices.append(correct_translation)
+    random.shuffle(choices)
+
+    return (
+        f"Що означає слово «{english_word}»?",
+        correct_translation,
+        choices,
+    )
+
+
 def answer_keyboard(
-    choices: list[int], task_id: int
+    choices: list[int | str], task_id: int
 ) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(
@@ -136,29 +274,61 @@ def answer_keyboard(
 def set_new_task(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> tuple[str, InlineKeyboardMarkup, int, int]:
-    correct_count = context.user_data.get("correct_count", 0)
-    level = min(correct_count // 3, 3)
-    choice_count = min(3 + level, 6)
-    expr, answer = generate_task(level)
     task_id = context.user_data.get("task_id", 0) + 1
+    task_number = context.user_data.get("task_number", 0) + 1
+    english_level = min(
+        context.user_data.get("english_level", 0),
+        ENGLISH_LEVEL_COUNT - 1,
+    )
+    math_level = min(
+        context.user_data.get("math_level", 0),
+        MATH_LEVEL_COUNT - 1,
+    )
+    english_interval = max(3, 5 - min(english_level // 3, 2))
 
-    context.user_data["answer"] = answer
+    if task_number % english_interval == 0:
+        choice_count = min(3 + english_level // 3, 6)
+        question, answer, choices = generate_english_task(
+            english_level, choice_count
+        )
+        question_type = "english"
+        task_level = english_level + 1
+    else:
+        choice_count = min(3 + math_level // 3, 6)
+        expression, numeric_answer = generate_task(math_level)
+        question = f"{expression} = ?"
+        answer = str(numeric_answer)
+        choices = [
+            str(choice)
+            for choice in generate_choices(numeric_answer, choice_count)
+        ]
+
+        question_type = "math"
+        task_level = math_level + 1
+
+    context.user_data["answer"] = answer.casefold()
     context.user_data["task_id"] = task_id
-    context.user_data["task_expression"] = expr
-    context.user_data["task_level"] = level + 1
+    context.user_data["task_number"] = task_number
+    context.user_data["task_expression"] = question
+    context.user_data["task_type"] = question_type
+    context.user_data["task_level"] = task_level
     context.user_data["task_choice_count"] = choice_count
     context.user_data.pop("last_wrong_emoji", None)
-    choices = generate_choices(answer, choice_count)
 
-    return expr, answer_keyboard(choices, task_id), level + 1, choice_count
+    return (
+        question,
+        answer_keyboard(choices, task_id),
+        task_level,
+        choice_count,
+    )
 
 
 async def send_new_task(
     message, context: ContextTypes.DEFAULT_TYPE, prefix: str = ""
 ) -> None:
-    expr, keyboard, _, _ = set_new_task(context)
+    question, keyboard, _, _ = set_new_task(context)
     heading = f"{prefix}\n\n" if prefix else ""
-    task_text = f"{heading}{expr} = ?"
+    task_text = f"{heading}{question}"
     context.user_data["task_text"] = task_text
     await message.reply_text(task_text, reply_markup=keyboard)
     context.user_data["task_started_at"] = monotonic()
@@ -168,7 +338,7 @@ async def celebrate_correct(
     message, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     await message.reply_text(random.choice(CORRECT_EMOJIS))
-    await send_new_task(message, context, "Готовий до наступного?")
+    await send_new_task(message, context, "Рухаємося далі:")
 
 
 async def encourage_retry(message) -> None:
@@ -178,8 +348,9 @@ async def encourage_retry(message) -> None:
 async def save_answer(
     user,
     context: ContextTypes.DEFAULT_TYPE,
-    selected_answer: int,
+    selected_answer: str,
 ) -> bool:
+    selected_answer = selected_answer.strip().casefold()
     correct_answer = context.user_data["answer"]
     is_correct = selected_answer == correct_answer
     answered_at = monotonic()
@@ -189,26 +360,32 @@ async def save_answer(
 
     if database.is_enabled():
         try:
-            correct_count = await database.record_answer(
+            progress = await database.record_answer(
                 user=user,
                 expression=context.user_data["task_expression"],
                 selected_answer=selected_answer,
                 correct_answer=correct_answer,
+                question_type=context.user_data["task_type"],
                 difficulty_level=context.user_data["task_level"],
                 answer_options=context.user_data["task_choice_count"],
                 response_time_ms=response_time_ms,
             )
-            context.user_data["correct_count"] = correct_count
+            context.user_data.update(progress)
             return is_correct
         except Exception:
             logging.exception(
                 "Could not save answer to PostgreSQL; using memory fallback"
             )
 
-    if is_correct:
-        context.user_data["correct_count"] = (
-            context.user_data.get("correct_count", 0) + 1
+    progress = {
+        key: context.user_data.get(key, value)
+        for key, value in database.empty_progress().items()
+    }
+    context.user_data.update(
+        database.advance_progress(
+            progress, context.user_data["task_type"], is_correct
         )
+    )
 
     return is_correct
 
@@ -216,16 +393,14 @@ async def save_answer(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     try:
-        correct_count = await database.get_correct_count(
-            update.effective_user
-        )
+        progress = await database.get_progress(update.effective_user)
     except Exception:
         logging.exception(
             "Could not load progress from PostgreSQL; starting in memory"
         )
-        correct_count = 0
+        progress = database.empty_progress()
 
-    context.user_data["correct_count"] = correct_count
+    context.user_data.update(progress)
     await update.message.reply_text(
         "Почнімо! Розв’язуй у своєму темпі — кількість спроб не обмежена.\n"
         "Обирай відповідь кнопкою. Якщо захочеш інший приклад, напиши /skip."
@@ -258,13 +433,15 @@ async def handle_message(
         await update.message.reply_text("Напиши /start, щоб почати.")
         return
 
-    if not text.replace("-", "", 1).isdigit():
+    if (
+        context.user_data["task_type"] == "math"
+        and not text.replace("-", "", 1).isdigit()
+    ):
         await update.message.reply_text("Введи число 😊")
         return
 
-    user_answer = int(text)
     is_correct = await save_answer(
-        update.effective_user, context, user_answer
+        update.effective_user, context, text
     )
 
     if is_correct:
@@ -280,7 +457,7 @@ async def handle_answer_button(
     query = update.callback_query
     _, task_id_text, answer_text = query.data.split(":", 2)
     task_id = int(task_id_text)
-    selected_answer = int(answer_text)
+    selected_answer = answer_text
 
     if task_id != context.user_data.get("task_id"):
         await query.answer("Цей приклад уже завершено 😊")
