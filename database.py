@@ -227,6 +227,7 @@ def apply_answer_to_progress(
     is_correct: bool,
     response_time_ms: int,
     first_attempt: bool,
+    offered_bonus_target_seconds: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     progress = {
         "subjects": {
@@ -242,7 +243,11 @@ def apply_answer_to_progress(
     was_calibrated = (
         state["calibration_correct"] >= CALIBRATION_CORRECT
     )
-    target_seconds = bonus_target_seconds(state)
+    target_seconds = (
+        offered_bonus_target_seconds
+        if offered_bonus_target_seconds is not None
+        else bonus_target_seconds(state)
+    )
     timing_class = classify_response_time(state, response_time_ms)
     affects_progress = first_attempt
     earned_bonus = bool(
@@ -644,6 +649,7 @@ async def record_answer(
     answer_options: int,
     response_time_ms: int,
     first_attempt: bool,
+    offered_bonus_target_seconds: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if _progress_pool is None:
         raise RuntimeError("Progress database is not connected")
@@ -679,6 +685,7 @@ async def record_answer(
                 is_correct,
                 response_time_ms,
                 first_attempt,
+                offered_bonus_target_seconds,
             )
             state = progress["subjects"][subject]
 

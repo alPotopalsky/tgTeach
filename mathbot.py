@@ -131,6 +131,11 @@ MATH_TOPIC_BY_MODE = {
 }
 ENGLISH_WORDS_TOPIC = "basic_words"
 TOPIC_COOLDOWN_HOURS = 24
+WARMUP_RESET_SECONDS = 10 * 60
+WARMUP_INITIAL_TARGET_SECONDS = 15
+WARMUP_MIDDLE_TARGET_SECONDS = 10
+WARMUP_MIDDLE_POINTS = 2
+WARMUP_COMPLETE_POINTS = 4
 
 
 def math_modes_for_level(level: int) -> list[str]:
@@ -327,6 +332,23 @@ def active_blocked_topics(
     return active
 
 
+def adaptive_bonus_target(
+    context: ContextTypes.DEFAULT_TYPE,
+    subject_progress: dict,
+) -> int:
+    personal_target = database.bonus_target_seconds(subject_progress)
+    warmup_points = context.user_data.get("warmup_points", 0)
+
+    if warmup_points < WARMUP_MIDDLE_POINTS:
+        return WARMUP_INITIAL_TARGET_SECONDS
+    if warmup_points < WARMUP_COMPLETE_POINTS:
+        return max(
+            WARMUP_MIDDLE_TARGET_SECONDS,
+            personal_target or WARMUP_MIDDLE_TARGET_SECONDS,
+        )
+    return personal_target or WARMUP_MIDDLE_TARGET_SECONDS
+
+
 def set_new_task(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> tuple[str, InlineKeyboardMarkup, int, int, int | None]:
@@ -405,7 +427,8 @@ def set_new_task(
     context.user_data["task_choice_count"] = choice_count
     context.user_data["task_attempts"] = 0
     context.user_data.pop("last_wrong_emoji", None)
-    bonus_target = database.bonus_target_seconds(subject_progress)
+    bonus_target = adaptive_bonus_target(context, subject_progress)
+    context.user_data["task_bonus_target_seconds"] = bonus_target
 
     return (
         question,
@@ -554,8 +577,18 @@ async def save_answer(
                 answer_options=context.user_data["task_choice_count"],
                 response_time_ms=response_time_ms,
                 first_attempt=first_attempt,
+                offered_bonus_target_seconds=context.user_data.get(
+                    "task_bonus_target_seconds"
+                ),
             )
             context.user_data["subjects"] = progress["subjects"]
+            update_warmup_state(
+                context,
+                event,
+                is_correct,
+                first_attempt,
+                answered_at,
+            )
             return is_correct, event
         except Exception:
             logging.exception(
@@ -573,14 +606,66 @@ async def save_answer(
         is_correct,
         response_time_ms,
         first_attempt,
+        context.user_data.get("task_bonus_target_seconds"),
     )
     context.user_data["subjects"] = progress["subjects"]
+    update_warmup_state(
+        context,
+        event,
+        is_correct,
+        first_attempt,
+        answered_at,
+    )
 
     return is_correct, event
 
 
+def update_warmup_state(
+    context: ContextTypes.DEFAULT_TYPE,
+    event: dict,
+    is_correct: bool,
+    first_attempt: bool,
+    answered_at: float,
+) -> None:
+    previous_answered_at = context.user_data.get(
+        "warmup_last_answered_at"
+    )
+    if (
+        previous_answered_at is None
+        or answered_at - previous_answered_at > WARMUP_RESET_SECONDS
+    ):
+        warmup_points = 0
+    else:
+        warmup_points = context.user_data.get("warmup_points", 0)
+
+    if first_attempt:
+        if is_correct and event["timing_class"] == "normal":
+            warmup_points = min(
+                WARMUP_COMPLETE_POINTS,
+                warmup_points + 1,
+            )
+        elif not is_correct or event["timing_class"] in {
+            "slow",
+            "suspicious",
+        }:
+            warmup_points = max(0, warmup_points - 1)
+
+    context.user_data["warmup_points"] = warmup_points
+    context.user_data["warmup_last_answered_at"] = answered_at
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await clear_bonus_reaction(context)
+    previous_answered_at = context.user_data.get(
+        "warmup_last_answered_at"
+    )
+    keep_warmup = (
+        previous_answered_at is not None
+        and monotonic() - previous_answered_at <= WARMUP_RESET_SECONDS
+    )
+    warmup_points = (
+        context.user_data.get("warmup_points", 0) if keep_warmup else 0
+    )
     context.user_data.clear()
     try:
         progress = await database.get_progress(update.effective_user)
@@ -591,6 +676,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         progress = database.empty_progress()
 
     context.user_data.update(progress)
+    context.user_data["warmup_points"] = warmup_points
+    if keep_warmup:
+        context.user_data["warmup_last_answered_at"] = (
+            previous_answered_at
+        )
     await update.message.reply_text(
         "Почнімо! Розв’язуй у своєму темпі — кількість спроб не обмежена.\n"
         "Обирай відповідь кнопкою. Якщо захочеш інший приклад, напиши /skip."
