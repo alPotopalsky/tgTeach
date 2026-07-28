@@ -831,6 +831,7 @@ def clear_interesting_state(
 ) -> None:
     for key in (
         "interesting_question_id",
+        "interesting_concept_id",
         "interesting_callback_token",
         "interesting_prompt",
         "interesting_choices",
@@ -838,6 +839,7 @@ def clear_interesting_state(
         "interesting_explanation",
         "interesting_started_at",
         "interesting_steps_remaining",
+        "interesting_correct_questions_by_concept",
     ):
         context.user_data.pop(key, None)
 
@@ -862,9 +864,12 @@ def interesting_keyboard(
 def interesting_answer_feedback(
     is_correct: bool,
     explanation: str,
+    concept_confirmed: bool,
 ) -> str:
-    if is_correct:
+    if is_correct and concept_confirmed:
         return f"✅\n\n{explanation}"
+    if is_correct:
+        return "✅"
     return "🤔"
 
 
@@ -886,6 +891,9 @@ async def send_interesting_question(
     callback_token = f"{random.getrandbits(32):08x}"
     context.user_data["interesting_question_id"] = question[
         "question_id"
+    ]
+    context.user_data["interesting_concept_id"] = question[
+        "concept_id"
     ]
     context.user_data["interesting_callback_token"] = callback_token
     context.user_data["interesting_prompt"] = question["prompt"]
@@ -938,6 +946,9 @@ async def start_interesting_route(
     context.user_data["interesting_steps_remaining"] = (
         INTERESTING_ROUTE_MAX_STEPS
     )
+    context.user_data[
+        "interesting_correct_questions_by_concept"
+    ] = {}
     try:
         sent = await send_interesting_question(
             message,
@@ -979,6 +990,7 @@ async def handle_interesting_answer(
         "interesting_correct_answer"
     ]
     is_correct = selected_answer == correct_answer
+    concept_id = context.user_data["interesting_concept_id"]
     started_at = context.user_data.get(
         "interesting_started_at",
         monotonic(),
@@ -999,32 +1011,57 @@ async def handle_interesting_answer(
     except Exception:
         logging.exception("Could not save an interesting answer")
 
-    explanation = context.user_data["interesting_explanation"]
-    feedback = interesting_answer_feedback(
-        is_correct,
-        explanation,
-    )
-    await query.edit_message_text(
-        f"✨ {context.user_data['interesting_prompt']}\n\n"
-        f"{feedback}"
-    )
-
     remaining = (
         context.user_data.get("interesting_steps_remaining", 1) - 1
     )
     context.user_data["interesting_steps_remaining"] = remaining
 
     next_question = None
-    if remaining > 0:
-        try:
-            next_question = await database.get_next_content_question(
-                question_id,
-                is_correct,
-            )
-        except Exception:
-            logging.exception("Could not load the next graph question")
+    next_lookup_failed = False
+    try:
+        next_question = await database.get_next_content_question(
+            question_id,
+            is_correct,
+        )
+    except Exception:
+        next_lookup_failed = True
+        logging.exception("Could not load the next graph question")
 
-    if next_question is not None:
+    correct_by_concept = context.user_data.setdefault(
+        "interesting_correct_questions_by_concept",
+        {},
+    )
+    correct_question_ids = correct_by_concept.setdefault(
+        concept_id,
+        set(),
+    )
+    if is_correct:
+        correct_question_ids.add(question_id)
+
+    has_harder_confirmation = (
+        is_correct
+        and next_question is not None
+        and next_question["concept_id"] == concept_id
+    )
+    concept_confirmed = (
+        is_correct
+        and len(correct_question_ids) >= 2
+        and not has_harder_confirmation
+        and not next_lookup_failed
+    )
+
+    explanation = context.user_data["interesting_explanation"]
+    feedback = interesting_answer_feedback(
+        is_correct,
+        explanation,
+        concept_confirmed,
+    )
+    await query.edit_message_text(
+        f"✨ {context.user_data['interesting_prompt']}\n\n"
+        f"{feedback}"
+    )
+
+    if remaining > 0 and next_question is not None:
         await send_interesting_question(
             query.message,
             context,
