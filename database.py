@@ -52,9 +52,20 @@ MAIN_SCHEMA = [
 
 LOG_SCHEMA = [
     """
+    CREATE TABLE IF NOT EXISTS log_users (
+        telegram_user_id BIGINT PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS answer_logs (
         id BIGSERIAL PRIMARY KEY,
-        telegram_user_id BIGINT NOT NULL,
+        telegram_user_id BIGINT NOT NULL
+            REFERENCES log_users (telegram_user_id) ON DELETE CASCADE,
         subject TEXT NOT NULL,
         task_id INTEGER NOT NULL,
         expression TEXT NOT NULL,
@@ -400,7 +411,7 @@ async def get_progress(user: Any) -> dict[str, Any]:
 
 async def _save_log(
     *,
-    user_id: int,
+    user: Any,
     subject: str,
     task_id: int,
     expression: str,
@@ -417,6 +428,20 @@ async def _save_log(
         return
 
     async with _log_pool.connection() as connection:
+        await connection.execute(
+            """
+            INSERT INTO log_users (
+                telegram_user_id, username, first_name, last_name
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (telegram_user_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                updated_at = NOW()
+            """,
+            (user.id, user.username, user.first_name, user.last_name),
+        )
         await connection.execute(
             """
             INSERT INTO answer_logs (
@@ -443,7 +468,7 @@ async def _save_log(
             )
             """,
             (
-                user_id,
+                user.id,
                 subject,
                 task_id,
                 expression,
@@ -539,7 +564,7 @@ async def record_answer(
 
     try:
         await _save_log(
-            user_id=user.id,
+            user=user,
             subject=subject,
             task_id=task_id,
             expression=expression,
