@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from statistics import median
@@ -64,6 +65,66 @@ MAIN_SCHEMA = [
     CREATE INDEX IF NOT EXISTS user_topic_cooldowns_expiry_idx
     ON user_topic_cooldowns (blocked_until)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS content_questions (
+        question_id TEXT PRIMARY KEY,
+        subject TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        difficulty_level SMALLINT NOT NULL
+            CHECK (difficulty_level BETWEEN 1 AND 10),
+        prompt TEXT NOT NULL,
+        answer_options JSONB NOT NULL,
+        correct_answer TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        is_entry BOOLEAN NOT NULL DEFAULT FALSE,
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        source TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS question_edges (
+        from_question_id TEXT NOT NULL
+            REFERENCES content_questions (question_id) ON DELETE CASCADE,
+        outcome TEXT NOT NULL
+            CHECK (
+                outcome IN (
+                    'correct',
+                    'wrong',
+                    'prerequisite',
+                    'related'
+                )
+            ),
+        to_question_id TEXT NOT NULL
+            REFERENCES content_questions (question_id) ON DELETE CASCADE,
+        priority SMALLINT NOT NULL DEFAULT 1,
+        PRIMARY KEY (
+            from_question_id,
+            outcome,
+            to_question_id
+        )
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS question_edges_route_idx
+    ON question_edges (from_question_id, outcome, priority)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS user_question_progress (
+        telegram_user_id BIGINT NOT NULL
+            REFERENCES bot_users (telegram_user_id) ON DELETE CASCADE,
+        question_id TEXT NOT NULL
+            REFERENCES content_questions (question_id) ON DELETE CASCADE,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        correct_answers INTEGER NOT NULL DEFAULT 0,
+        mastery_score SMALLINT NOT NULL DEFAULT 0
+            CHECK (mastery_score BETWEEN 0 AND 100),
+        last_answered_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (telegram_user_id, question_id)
+    )
+    """,
 ]
 
 LOG_SCHEMA = [
@@ -129,6 +190,170 @@ LOG_SCHEMA = [
     CREATE INDEX IF NOT EXISTS topic_feedback_logs_created_at_idx
     ON topic_feedback_logs (created_at)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS content_answer_logs (
+        id BIGSERIAL PRIMARY KEY,
+        telegram_user_id BIGINT NOT NULL
+            REFERENCES log_users (telegram_user_id) ON DELETE CASCADE,
+        question_id TEXT NOT NULL,
+        selected_answer TEXT NOT NULL,
+        correct_answer TEXT NOT NULL,
+        is_correct BOOLEAN NOT NULL,
+        response_time_ms INTEGER NOT NULL,
+        answered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS content_answer_logs_user_time_idx
+    ON content_answer_logs (telegram_user_id, answered_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS content_answer_logs_question_idx
+    ON content_answer_logs (question_id, answered_at DESC)
+    """,
+]
+
+CONTENT_QUESTIONS = [
+    {
+        "question_id": "health_defibrillator_action",
+        "subject": "curiosity",
+        "topic": "heart_and_first_aid",
+        "difficulty_level": 5,
+        "prompt": "Що насправді робить дефібрилятор?",
+        "answer_options": [
+            (
+                "Подає контрольований розряд при певних небезпечних "
+                "порушеннях ритму"
+            ),
+            "Замінює серце й сам перекачує кров",
+            "Завжди запускає серце, яке повністю зупинилося",
+        ],
+        "correct_answer": (
+            "Подає контрольований розряд при певних небезпечних "
+            "порушеннях ритму"
+        ),
+        "explanation": (
+            "Розряд припиняє деякі хаотичні ритми, щоб природна "
+            "електрична система серця могла відновити нормальний ритм."
+        ),
+        "is_entry": True,
+        "source": (
+            "https://www.heart.org/en/news/2023/01/17/"
+            "5-things-to-know-about-aeds-after-a-defibrillator-"
+            "helped-save-damar-hamlin"
+        ),
+    },
+    {
+        "question_id": "health_heart_rhythm",
+        "subject": "curiosity",
+        "topic": "heart_and_first_aid",
+        "difficulty_level": 3,
+        "prompt": "Що означає «ритм серця»?",
+        "answer_options": [
+            "Послідовність і частоту скорочень серця",
+            "Кількість крові в організмі",
+            "Температуру серцевого м’яза",
+        ],
+        "correct_answer": "Послідовність і частоту скорочень серця",
+        "explanation": (
+            "Ритм описує, як регулярно і з якою частотою серце "
+            "скорочується."
+        ),
+        "is_entry": False,
+        "source": "https://www.heart.org/en/health-topics/arrhythmia",
+    },
+    {
+        "question_id": "health_heart_job",
+        "subject": "curiosity",
+        "topic": "heart_and_first_aid",
+        "difficulty_level": 1,
+        "prompt": "Яка головна робота серця?",
+        "answer_options": [
+            "Перекачувати кров організмом",
+            "Допомагати легеням вдихати повітря",
+            "Перетравлювати їжу",
+        ],
+        "correct_answer": "Перекачувати кров організмом",
+        "explanation": (
+            "Серце працює як насос і рухає кров, яка переносить "
+            "кисень та поживні речовини."
+        ),
+        "is_entry": False,
+        "source": (
+            "https://www.nhlbi.nih.gov/health/heart/"
+            "how-the-heart-works"
+        ),
+    },
+    {
+        "question_id": "health_aed_analysis",
+        "subject": "curiosity",
+        "topic": "heart_and_first_aid",
+        "difficulty_level": 7,
+        "prompt": (
+            "Навіщо автоматичний дефібрилятор спочатку аналізує "
+            "ритм серця?"
+        ),
+        "answer_options": [
+            "Щоб визначити, чи потребує цей ритм розряду",
+            "Щоб виміряти температуру тіла",
+            "Щоб вибрати ліки для людини",
+        ],
+        "correct_answer": (
+            "Щоб визначити, чи потребує цей ритм розряду"
+        ),
+        "explanation": (
+            "AED подає розряд лише для ритмів, які можна виправити "
+            "дефібриляцією."
+        ),
+        "is_entry": False,
+        "source": (
+            "https://www.redcross.org/take-a-class/"
+            "organizations/aed-program"
+        ),
+    },
+    {
+        "question_id": "health_flatline",
+        "subject": "curiosity",
+        "topic": "heart_and_first_aid",
+        "difficulty_level": 8,
+        "prompt": (
+            "Чому дефібрилятор зазвичай не подає розряд при "
+            "асистолії — «прямій лінії»?"
+        ),
+        "answer_options": [
+            (
+                "Немає хаотичного електричного ритму, який розряд "
+                "міг би припинити"
+            ),
+            "Розряд працює лише в лікарні",
+            "Асистолія означає нормальний повільний ритм",
+        ],
+        "correct_answer": (
+            "Немає хаотичного електричного ритму, який розряд "
+            "міг би припинити"
+        ),
+        "explanation": (
+            "При асистолії потрібні СЛР та медична допомога; "
+            "дефібриляція не створює ритм із повної відсутності "
+            "електричної активності."
+        ),
+        "is_entry": False,
+        "source": (
+            "https://cpr.heart.org/en/resuscitation-science/"
+            "cpr-and-ecc-guidelines/adult-advanced-life-support"
+        ),
+    },
+]
+
+CONTENT_EDGES = [
+    ("health_defibrillator_action", "correct", "health_aed_analysis", 1),
+    ("health_defibrillator_action", "wrong", "health_heart_rhythm", 1),
+    ("health_heart_rhythm", "correct", "health_defibrillator_action", 1),
+    ("health_heart_rhythm", "wrong", "health_heart_job", 1),
+    ("health_heart_job", "correct", "health_heart_rhythm", 1),
+    ("health_aed_analysis", "correct", "health_flatline", 1),
+    ("health_aed_analysis", "wrong", "health_defibrillator_action", 1),
+    ("health_flatline", "wrong", "health_aed_analysis", 1),
 ]
 
 UPSERT_USER = """
@@ -341,6 +566,79 @@ async def _prepare_schema(
             await connection.execute(statement)
 
 
+async def _seed_content(pool: AsyncConnectionPool) -> None:
+    async with pool.connection(timeout=30) as connection:
+        async with connection.transaction():
+            for question in CONTENT_QUESTIONS:
+                await connection.execute(
+                    """
+                    INSERT INTO content_questions (
+                        question_id,
+                        subject,
+                        topic,
+                        difficulty_level,
+                        prompt,
+                        answer_options,
+                        correct_answer,
+                        explanation,
+                        is_entry,
+                        source
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s::jsonb,
+                        %s, %s, %s, %s
+                    )
+                    ON CONFLICT (question_id) DO UPDATE SET
+                        subject = EXCLUDED.subject,
+                        topic = EXCLUDED.topic,
+                        difficulty_level = EXCLUDED.difficulty_level,
+                        prompt = EXCLUDED.prompt,
+                        answer_options = EXCLUDED.answer_options,
+                        correct_answer = EXCLUDED.correct_answer,
+                        explanation = EXCLUDED.explanation,
+                        is_entry = EXCLUDED.is_entry,
+                        active = TRUE,
+                        source = EXCLUDED.source,
+                        updated_at = NOW()
+                    """,
+                    (
+                        question["question_id"],
+                        question["subject"],
+                        question["topic"],
+                        question["difficulty_level"],
+                        question["prompt"],
+                        json.dumps(
+                            question["answer_options"],
+                            ensure_ascii=False,
+                        ),
+                        question["correct_answer"],
+                        question["explanation"],
+                        question["is_entry"],
+                        question["source"],
+                    ),
+                )
+
+            for edge in CONTENT_EDGES:
+                await connection.execute(
+                    """
+                    INSERT INTO question_edges (
+                        from_question_id,
+                        outcome,
+                        to_question_id,
+                        priority
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (
+                        from_question_id,
+                        outcome,
+                        to_question_id
+                    ) DO UPDATE SET
+                        priority = EXCLUDED.priority
+                    """,
+                    edge,
+                )
+
+
 async def connect_database(_) -> None:
     global _progress_pool, _log_pool, _log_pool_is_shared
 
@@ -354,6 +652,7 @@ async def connect_database(_) -> None:
     _progress_pool = _new_pool(database_url)
     await _progress_pool.open()
     await _prepare_schema(_progress_pool, MAIN_SCHEMA)
+    await _seed_content(_progress_pool)
 
     log_database_url = os.getenv("LOG_DATABASE_URL")
     if log_database_url:
@@ -465,6 +764,243 @@ async def get_progress(user: Any) -> dict[str, Any]:
             progress = await _load_subject_rows(connection, user.id)
 
     return progress
+
+
+def _fallback_content_question(
+    question_id: str | None = None,
+) -> dict[str, Any] | None:
+    candidates = [
+        question
+        for question in CONTENT_QUESTIONS
+        if (
+            question_id is None
+            and question["is_entry"]
+        )
+        or question["question_id"] == question_id
+    ]
+    if not candidates:
+        return None
+    return {
+        **candidates[0],
+        "answer_options": list(candidates[0]["answer_options"]),
+    }
+
+
+def _content_question_from_row(row) -> dict[str, Any]:
+    return {
+        "question_id": row[0],
+        "subject": row[1],
+        "topic": row[2],
+        "difficulty_level": int(row[3]),
+        "prompt": row[4],
+        "answer_options": list(row[5]),
+        "correct_answer": row[6],
+        "explanation": row[7],
+        "is_entry": bool(row[8]),
+    }
+
+
+async def get_content_question(
+    question_id: str | None = None,
+    user_id: int | None = None,
+) -> dict[str, Any] | None:
+    if _progress_pool is None:
+        return _fallback_content_question(question_id)
+
+    async with _progress_pool.connection() as connection:
+        if question_id is not None:
+            cursor = await connection.execute(
+                """
+                SELECT
+                    question_id,
+                    subject,
+                    topic,
+                    difficulty_level,
+                    prompt,
+                    answer_options,
+                    correct_answer,
+                    explanation,
+                    is_entry
+                FROM content_questions
+                WHERE question_id = %s AND active
+                """,
+                (question_id,),
+            )
+        else:
+            cursor = await connection.execute(
+                """
+                SELECT
+                    q.question_id,
+                    q.subject,
+                    q.topic,
+                    q.difficulty_level,
+                    q.prompt,
+                    q.answer_options,
+                    q.correct_answer,
+                    q.explanation,
+                    q.is_entry
+                FROM content_questions AS q
+                LEFT JOIN user_question_progress AS p
+                    ON p.question_id = q.question_id
+                   AND p.telegram_user_id = %s
+                WHERE q.active AND q.is_entry
+                ORDER BY
+                    p.last_answered_at ASC NULLS FIRST,
+                    RANDOM()
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+        row = await cursor.fetchone()
+
+    return _content_question_from_row(row) if row else None
+
+
+async def get_next_content_question(
+    question_id: str,
+    is_correct: bool,
+) -> dict[str, Any] | None:
+    outcome = "correct" if is_correct else "wrong"
+
+    if _progress_pool is None:
+        candidates = [
+            edge
+            for edge in CONTENT_EDGES
+            if edge[0] == question_id and edge[1] == outcome
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda edge: edge[3])
+        return _fallback_content_question(candidates[0][2])
+
+    async with _progress_pool.connection() as connection:
+        cursor = await connection.execute(
+            """
+            SELECT q.question_id
+            FROM question_edges AS e
+            JOIN content_questions AS q
+              ON q.question_id = e.to_question_id
+            WHERE e.from_question_id = %s
+              AND e.outcome = %s
+              AND q.active
+            ORDER BY e.priority, RANDOM()
+            LIMIT 1
+            """,
+            (question_id, outcome),
+        )
+        row = await cursor.fetchone()
+
+    return await get_content_question(row[0]) if row else None
+
+
+async def record_content_answer(
+    *,
+    user: Any,
+    question_id: str,
+    selected_answer: str,
+    correct_answer: str,
+    response_time_ms: int,
+) -> None:
+    is_correct = selected_answer == correct_answer
+
+    if _progress_pool is not None:
+        async with _progress_pool.connection() as connection:
+            async with connection.transaction():
+                await _upsert_user(connection, user)
+                await connection.execute(
+                    """
+                    INSERT INTO user_question_progress (
+                        telegram_user_id,
+                        question_id,
+                        attempts,
+                        correct_answers,
+                        mastery_score,
+                        last_answered_at
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        1,
+                        %s,
+                        %s,
+                        NOW()
+                    )
+                    ON CONFLICT (telegram_user_id, question_id)
+                    DO UPDATE SET
+                        attempts =
+                            user_question_progress.attempts + 1,
+                        correct_answers =
+                            user_question_progress.correct_answers
+                            + EXCLUDED.correct_answers,
+                        mastery_score = LEAST(
+                            100,
+                            GREATEST(
+                                0,
+                                user_question_progress.mastery_score
+                                + %s
+                            )
+                        ),
+                        last_answered_at = NOW(),
+                        updated_at = NOW()
+                    """,
+                    (
+                        user.id,
+                        question_id,
+                        int(is_correct),
+                        15 if is_correct else 0,
+                        15 if is_correct else -5,
+                    ),
+                )
+
+    if _log_pool is not None:
+        try:
+            async with _log_pool.connection() as connection:
+                async with connection.transaction():
+                    await connection.execute(
+                        """
+                        INSERT INTO log_users (
+                            telegram_user_id,
+                            username,
+                            first_name,
+                            last_name
+                        )
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (telegram_user_id) DO UPDATE SET
+                            username = EXCLUDED.username,
+                            first_name = EXCLUDED.first_name,
+                            last_name = EXCLUDED.last_name,
+                            updated_at = NOW()
+                        """,
+                        (
+                            user.id,
+                            user.username,
+                            user.first_name,
+                            user.last_name,
+                        ),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO content_answer_logs (
+                            telegram_user_id,
+                            question_id,
+                            selected_answer,
+                            correct_answer,
+                            is_correct,
+                            response_time_ms
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            user.id,
+                            question_id,
+                            selected_answer,
+                            correct_answer,
+                            is_correct,
+                            response_time_ms,
+                        ),
+                    )
+        except Exception:
+            logging.exception("Could not save content answer log")
 
 
 async def block_topic(

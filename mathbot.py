@@ -4,7 +4,7 @@ import logging
 import os
 import random
 from pathlib import Path
-from time import monotonic, time
+from time import monotonic
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
@@ -130,7 +130,7 @@ MATH_TOPIC_BY_MODE = {
     "div_large": "division",
 }
 ENGLISH_WORDS_TOPIC = "basic_words"
-TOPIC_COOLDOWN_HOURS = 24
+INTERESTING_ROUTE_LENGTH = 3
 WARMUP_RESET_SECONDS = 10 * 60
 WARMUP_INITIAL_TARGET_SECONDS = 15
 WARMUP_MIDDLE_TARGET_SECONDS = 10
@@ -291,7 +291,6 @@ def generate_english_task(
 def answer_keyboard(
     choices: list[int | str],
     task_id: int,
-    allow_topic_cooldown: bool,
 ) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(
@@ -304,32 +303,15 @@ def answer_keyboard(
         buttons[index : index + row_size]
         for index in range(0, len(buttons), row_size)
     ]
-    if allow_topic_cooldown:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "🥱 Набридло",
-                    callback_data=f"bored:{task_id}",
-                )
-            ]
-        )
-    return InlineKeyboardMarkup(rows)
-
-
-def active_blocked_topics(
-    context: ContextTypes.DEFAULT_TYPE,
-) -> dict[str, float]:
-    now = time()
-    blocked_topics = context.user_data.setdefault(
-        "blocked_topics", {}
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "✨ Щось цікаве",
+                callback_data=f"interesting:{task_id}",
+            )
+        ]
     )
-    active = {
-        key: float(blocked_until)
-        for key, blocked_until in blocked_topics.items()
-        if float(blocked_until) > now
-    }
-    context.user_data["blocked_topics"] = active
-    return active
+    return InlineKeyboardMarkup(rows)
 
 
 def adaptive_bonus_target(
@@ -368,23 +350,10 @@ def set_new_task(
         min(math_progress["level"], MATH_LEVEL_COUNT),
     )
     english_interval = max(3, 5 - min((english_level - 1) // 3, 2))
-    blocked_topics = active_blocked_topics(context)
-    math_modes = [
-        mode
-        for mode in math_modes_for_level(math_level - 1)
-        if f"math:{MATH_TOPIC_BY_MODE[mode]}" not in blocked_topics
-    ]
-    english_topic_key = f"english:{ENGLISH_WORDS_TOPIC}"
-    english_available = english_topic_key not in blocked_topics
-
-    if not math_modes and not english_available:
-        blocked_topics.clear()
-        math_modes = math_modes_for_level(math_level - 1)
-        english_available = True
-
+    math_modes = math_modes_for_level(math_level - 1)
     prefer_english = task_number % english_interval == 0
 
-    if prefer_english and english_available or not math_modes:
+    if prefer_english:
         choice_count = min(3 + (english_level - 1) // 3, 6)
         question, answer, choices = generate_english_task(
             english_level - 1, choice_count
@@ -410,13 +379,6 @@ def set_new_task(
         task_level = math_level
         subject_progress = math_progress
 
-    available_topic_keys = {
-        f"math:{MATH_TOPIC_BY_MODE[mode]}" for mode in math_modes
-    }
-    if english_available:
-        available_topic_keys.add(english_topic_key)
-    allow_topic_cooldown = len(available_topic_keys) > 1
-
     context.user_data["answer"] = answer.casefold()
     context.user_data["task_id"] = task_id
     context.user_data["task_number"] = task_number
@@ -432,7 +394,7 @@ def set_new_task(
 
     return (
         question,
-        answer_keyboard(choices, task_id, allow_topic_cooldown),
+        answer_keyboard(choices, task_id),
         task_level,
         choice_count,
         bonus_target,
@@ -692,6 +654,7 @@ async def skip_task(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     await clear_bonus_reaction(context)
+    clear_interesting_state(context)
     previous_answer = context.user_data.get("answer")
 
     if previous_answer is None:
@@ -705,7 +668,80 @@ async def skip_task(
     await send_new_task(update.message, context, prefix)
 
 
-async def handle_bored_button(
+def clear_interesting_state(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    for key in (
+        "interesting_question_id",
+        "interesting_callback_token",
+        "interesting_prompt",
+        "interesting_choices",
+        "interesting_correct_answer",
+        "interesting_explanation",
+        "interesting_started_at",
+        "interesting_steps_remaining",
+    ):
+        context.user_data.pop(key, None)
+
+
+def interesting_keyboard(
+    callback_token: str,
+    choices: list[str],
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    choice,
+                    callback_data=f"iq:{callback_token}:{index}",
+                )
+            ]
+            for index, choice in enumerate(choices)
+        ]
+    )
+
+
+async def send_interesting_question(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    question: dict | None = None,
+    user_id: int | None = None,
+) -> bool:
+    if question is None:
+        question = await database.get_content_question(
+            user_id=user_id,
+        )
+    if question is None:
+        return False
+
+    choices = list(question["answer_options"])
+    random.shuffle(choices)
+    callback_token = f"{random.getrandbits(32):08x}"
+    context.user_data["interesting_question_id"] = question[
+        "question_id"
+    ]
+    context.user_data["interesting_callback_token"] = callback_token
+    context.user_data["interesting_prompt"] = question["prompt"]
+    context.user_data["interesting_choices"] = choices
+    context.user_data["interesting_correct_answer"] = question[
+        "correct_answer"
+    ]
+    context.user_data["interesting_explanation"] = question[
+        "explanation"
+    ]
+
+    await message.reply_text(
+        f"✨ {question['prompt']}",
+        reply_markup=interesting_keyboard(
+            callback_token,
+            choices,
+        ),
+    )
+    context.user_data["interesting_started_at"] = monotonic()
+    return True
+
+
+async def handle_interesting_button(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     query = update.callback_query
@@ -716,32 +752,111 @@ async def handle_bored_button(
         await query.answer("Це завдання вже завершено 😊")
         return
 
-    await query.answer("Відклали цю тему на добу 👌")
+    await query.answer()
     await clear_bonus_reaction(context)
+    await query.edit_message_reply_markup(reply_markup=None)
+    context.user_data["interesting_steps_remaining"] = (
+        INTERESTING_ROUTE_LENGTH
+    )
+    try:
+        sent = await send_interesting_question(
+            query.message,
+            context,
+            user_id=query.from_user.id,
+        )
+    except Exception:
+        logging.exception("Could not load an interesting question")
+        sent = False
 
-    subject = context.user_data["task_type"]
-    topic = context.user_data["task_topic"]
-    topic_key = f"{subject}:{topic}"
-    blocked_until = time() + TOPIC_COOLDOWN_HOURS * 60 * 60
+    if not sent:
+        clear_interesting_state(context)
+        await send_new_task(query.message, context)
 
-    if database.is_enabled():
+
+async def handle_interesting_answer(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    _, callback_token, choice_index_text = query.data.split(":", 2)
+
+    if callback_token != context.user_data.get(
+        "interesting_callback_token"
+    ):
+        await query.answer("Це питання вже завершено 😊")
+        return
+
+    question_id = context.user_data["interesting_question_id"]
+    choices = context.user_data["interesting_choices"]
+    choice_index = int(choice_index_text)
+    if choice_index < 0 or choice_index >= len(choices):
+        await query.answer("Варіант уже недоступний")
+        return
+
+    await query.answer()
+    context.user_data.pop("interesting_callback_token", None)
+    selected_answer = choices[choice_index]
+    correct_answer = context.user_data[
+        "interesting_correct_answer"
+    ]
+    is_correct = selected_answer == correct_answer
+    started_at = context.user_data.get(
+        "interesting_started_at",
+        monotonic(),
+    )
+    response_time_ms = max(
+        0,
+        round((monotonic() - started_at) * 1_000),
+    )
+
+    try:
+        await database.record_content_answer(
+            user=query.from_user,
+            question_id=question_id,
+            selected_answer=selected_answer,
+            correct_answer=correct_answer,
+            response_time_ms=response_time_ms,
+        )
+    except Exception:
+        logging.exception("Could not save an interesting answer")
+
+    explanation = context.user_data["interesting_explanation"]
+    if is_correct:
+        feedback = f"✅\n\n{explanation}"
+    else:
+        feedback = (
+            f"❌ Правильна відповідь: {correct_answer}\n\n"
+            f"{explanation}"
+        )
+    await query.edit_message_text(
+        f"✨ {context.user_data['interesting_prompt']}\n\n"
+        f"{feedback}"
+    )
+
+    remaining = (
+        context.user_data.get("interesting_steps_remaining", 1) - 1
+    )
+    context.user_data["interesting_steps_remaining"] = remaining
+
+    next_question = None
+    if remaining > 0:
         try:
-            blocked_until = await database.block_topic(
-                user=query.from_user,
-                subject=subject,
-                topic=topic,
-                expression=context.user_data["task_expression"],
-                hours=TOPIC_COOLDOWN_HOURS,
+            next_question = await database.get_next_content_question(
+                question_id,
+                is_correct,
             )
         except Exception:
-            logging.exception(
-                "Could not save topic cooldown; using memory fallback"
-            )
+            logging.exception("Could not load the next graph question")
 
-    context.user_data.setdefault("blocked_topics", {})[
-        topic_key
-    ] = blocked_until
-    await query.edit_message_reply_markup(reply_markup=None)
+    if next_question is not None:
+        await send_interesting_question(
+            query.message,
+            context,
+            next_question,
+        )
+        context.user_data["interesting_steps_remaining"] = remaining
+        return
+
+    clear_interesting_state(context)
     await send_new_task(query.message, context)
 
 
@@ -749,6 +864,10 @@ async def handle_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     text = update.message.text.strip()
+
+    if "interesting_question_id" in context.user_data:
+        await update.message.reply_text("Обери варіант кнопкою 😊")
+        return
 
     if "answer" not in context.user_data:
         await update.message.reply_text("Напиши /start, щоб почати.")
@@ -824,7 +943,16 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("skip", skip_task))
     app.add_handler(
-        CallbackQueryHandler(handle_bored_button, pattern=r"^bored:")
+        CallbackQueryHandler(
+            handle_interesting_button,
+            pattern=r"^interesting:",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            handle_interesting_answer,
+            pattern=r"^iq:",
+        )
     )
     app.add_handler(
         CallbackQueryHandler(handle_answer_button, pattern=r"^answer:")
