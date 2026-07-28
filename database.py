@@ -70,6 +70,7 @@ MAIN_SCHEMA = [
         question_id TEXT PRIMARY KEY,
         subject TEXT NOT NULL,
         topic TEXT NOT NULL,
+        concept_id TEXT,
         difficulty_level SMALLINT NOT NULL
             CHECK (difficulty_level BETWEEN 1 AND 10),
         prompt TEXT NOT NULL,
@@ -82,6 +83,10 @@ MAIN_SCHEMA = [
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+    """,
+    """
+    ALTER TABLE content_questions
+    ADD COLUMN IF NOT EXISTS concept_id TEXT
     """,
     """
     CREATE TABLE IF NOT EXISTS question_edges (
@@ -218,6 +223,7 @@ CONTENT_QUESTIONS = [
         "question_id": "health_defibrillator_action",
         "subject": "curiosity",
         "topic": "heart_and_first_aid",
+        "concept_id": "aed_operation",
         "difficulty_level": 5,
         "prompt": (
             "Що робить автоматичний дефібрилятор (AED) перед тим, "
@@ -250,6 +256,7 @@ CONTENT_QUESTIONS = [
         "question_id": "health_heart_rhythm",
         "subject": "curiosity",
         "topic": "heart_and_first_aid",
+        "concept_id": "heart_rhythm",
         "difficulty_level": 3,
         "prompt": "Що означає «перевірити ритм серця»?",
         "answer_options": [
@@ -266,9 +273,32 @@ CONTENT_QUESTIONS = [
         "source": "https://www.heart.org/en/health-topics/arrhythmia",
     },
     {
+        "question_id": "health_rhythm_pattern",
+        "subject": "curiosity",
+        "topic": "heart_and_first_aid",
+        "concept_id": "heart_rhythm",
+        "difficulty_level": 4,
+        "prompt": "Який опис найбільше схожий на рівний ритм?",
+        "answer_options": [
+            "Удари відбуваються через приблизно однакові проміжки",
+            "Кожен наступний удар обов’язково сильніший",
+            "Серце час від часу повністю змінює напрямок роботи",
+        ],
+        "correct_answer": (
+            "Удари відбуваються через приблизно однакові проміжки"
+        ),
+        "explanation": (
+            "Рівний ритм означає, що скорочення повторюються "
+            "послідовно через схожі проміжки часу."
+        ),
+        "is_entry": False,
+        "source": "https://www.heart.org/en/health-topics/arrhythmia",
+    },
+    {
         "question_id": "health_heart_job",
         "subject": "curiosity",
         "topic": "heart_and_first_aid",
+        "concept_id": "heart_as_pump",
         "difficulty_level": 1,
         "prompt": "Яка головна робота серця?",
         "answer_options": [
@@ -288,9 +318,35 @@ CONTENT_QUESTIONS = [
         ),
     },
     {
+        "question_id": "health_blood_delivery",
+        "subject": "curiosity",
+        "topic": "heart_and_first_aid",
+        "concept_id": "heart_as_pump",
+        "difficulty_level": 2,
+        "prompt": "Навіщо серце постійно перекачує кров?",
+        "answer_options": [
+            "Щоб доставляти клітинам кисень і поживні речовини",
+            "Щоб підтримувати однакову довжину судин",
+            "Щоб легені могли самі рухатися",
+        ],
+        "correct_answer": (
+            "Щоб доставляти клітинам кисень і поживні речовини"
+        ),
+        "explanation": (
+            "Кров переносить потрібні клітинам речовини, а серце "
+            "підтримує її рух організмом."
+        ),
+        "is_entry": False,
+        "source": (
+            "https://www.nhlbi.nih.gov/health/heart/"
+            "how-the-heart-works"
+        ),
+    },
+    {
         "question_id": "health_aed_analysis",
         "subject": "curiosity",
         "topic": "heart_and_first_aid",
+        "concept_id": "aed_operation",
         "difficulty_level": 7,
         "prompt": (
             "Чому AED не подає електричний імпульс щоразу?"
@@ -317,6 +373,7 @@ CONTENT_QUESTIONS = [
         "question_id": "health_flatline",
         "subject": "curiosity",
         "topic": "heart_and_first_aid",
+        "concept_id": "aed_operation",
         "difficulty_level": 8,
         "prompt": (
             "Як AED допомагає людині, яка не є медиком?"
@@ -344,12 +401,19 @@ CONTENT_QUESTIONS = [
 CONTENT_EDGES = [
     ("health_defibrillator_action", "correct", "health_aed_analysis", 1),
     ("health_defibrillator_action", "wrong", "health_heart_rhythm", 1),
-    ("health_heart_rhythm", "correct", "health_defibrillator_action", 1),
+    ("health_heart_rhythm", "correct", "health_rhythm_pattern", 1),
     ("health_heart_rhythm", "wrong", "health_heart_job", 1),
-    ("health_heart_job", "correct", "health_heart_rhythm", 1),
+    ("health_rhythm_pattern", "wrong", "health_heart_rhythm", 1),
+    ("health_heart_job", "correct", "health_blood_delivery", 1),
+    ("health_blood_delivery", "wrong", "health_heart_job", 1),
     ("health_aed_analysis", "correct", "health_flatline", 1),
     ("health_aed_analysis", "wrong", "health_defibrillator_action", 1),
     ("health_flatline", "wrong", "health_aed_analysis", 1),
+]
+
+REMOVED_CONTENT_EDGES = [
+    ("health_heart_rhythm", "correct", "health_defibrillator_action"),
+    ("health_heart_job", "correct", "health_heart_rhythm"),
 ]
 
 UPSERT_USER = """
@@ -578,11 +642,12 @@ async def _seed_content(pool: AsyncConnectionPool) -> None:
                         correct_answer,
                         explanation,
                         is_entry,
+                        concept_id,
                         source
                     )
                     VALUES (
                         %s, %s, %s, %s, %s, %s::jsonb,
-                        %s, %s, %s, %s
+                        %s, %s, %s, %s, %s
                     )
                     ON CONFLICT (question_id) DO UPDATE SET
                         subject = EXCLUDED.subject,
@@ -593,6 +658,7 @@ async def _seed_content(pool: AsyncConnectionPool) -> None:
                         correct_answer = EXCLUDED.correct_answer,
                         explanation = EXCLUDED.explanation,
                         is_entry = EXCLUDED.is_entry,
+                        concept_id = EXCLUDED.concept_id,
                         active = TRUE,
                         source = EXCLUDED.source,
                         updated_at = NOW()
@@ -610,8 +676,20 @@ async def _seed_content(pool: AsyncConnectionPool) -> None:
                         question["correct_answer"],
                         question["explanation"],
                         question["is_entry"],
+                        question["concept_id"],
                         question["source"],
                     ),
+                )
+
+            for edge in REMOVED_CONTENT_EDGES:
+                await connection.execute(
+                    """
+                    DELETE FROM question_edges
+                    WHERE from_question_id = %s
+                      AND outcome = %s
+                      AND to_question_id = %s
+                    """,
+                    edge,
                 )
 
             for edge in CONTENT_EDGES:
@@ -793,6 +871,7 @@ def _content_question_from_row(row) -> dict[str, Any]:
         "correct_answer": row[6],
         "explanation": row[7],
         "is_entry": bool(row[8]),
+        "concept_id": row[9],
     }
 
 
@@ -816,7 +895,8 @@ async def get_content_question(
                     answer_options,
                     correct_answer,
                     explanation,
-                    is_entry
+                    is_entry,
+                    concept_id
                 FROM content_questions
                 WHERE question_id = %s AND active
                 """,
@@ -834,7 +914,8 @@ async def get_content_question(
                     q.answer_options,
                     q.correct_answer,
                     q.explanation,
-                    q.is_entry
+                    q.is_entry,
+                    q.concept_id
                 FROM content_questions AS q
                 LEFT JOIN user_question_progress AS p
                     ON p.question_id = q.question_id
@@ -867,7 +948,17 @@ async def get_next_content_question(
         if not candidates:
             return None
         candidates.sort(key=lambda edge: edge[3])
-        return _fallback_content_question(candidates[0][2])
+        next_question = _fallback_content_question(candidates[0][2])
+        current_question = _fallback_content_question(question_id)
+        if (
+            outcome == "correct"
+            and next_question is not None
+            and current_question is not None
+            and next_question["concept_id"]
+            != current_question["concept_id"]
+        ):
+            return None
+        return next_question
 
     async with _progress_pool.connection() as connection:
         cursor = await connection.execute(
@@ -876,9 +967,18 @@ async def get_next_content_question(
             FROM question_edges AS e
             JOIN content_questions AS q
               ON q.question_id = e.to_question_id
+            JOIN content_questions AS source_q
+              ON source_q.question_id = e.from_question_id
             WHERE e.from_question_id = %s
               AND e.outcome = %s
               AND q.active
+              AND (
+                    e.outcome <> 'correct'
+                    OR (
+                        source_q.concept_id IS NOT NULL
+                        AND q.concept_id = source_q.concept_id
+                    )
+              )
             ORDER BY e.priority, RANDOM()
             LIMIT 1
             """,
