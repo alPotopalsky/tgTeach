@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 import os
@@ -6,6 +7,7 @@ from pathlib import Path
 from time import monotonic
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -338,17 +340,95 @@ async def send_new_task(
 ) -> None:
     question, keyboard, _, _, bonus_target = set_new_task(context)
     heading = f"{prefix}\n\n" if prefix else ""
-    bonus_text = ""
-    if bonus_target is not None:
-        bonus_text = (
-            "\n\n"
-            f"⚡ Бонус за правильну відповідь з першої спроби "
-            f"до {bonus_target} с!"
-        )
-    task_text = f"{heading}{question}{bonus_text}"
+    task_text = f"{heading}{question}"
     context.user_data["task_text"] = task_text
-    await message.reply_text(task_text, reply_markup=keyboard)
+    task_message = await message.reply_text(task_text, reply_markup=keyboard)
     context.user_data["task_started_at"] = monotonic()
+
+    if bonus_target is not None:
+        try:
+            await task_message.set_reaction("⚡", is_big=True)
+        except TelegramError:
+            logging.warning(
+                "Could not set the bonus reaction",
+                exc_info=True,
+            )
+        else:
+            context.user_data["bonus_reaction_chat_id"] = (
+                task_message.chat_id
+            )
+            context.user_data["bonus_reaction_message_id"] = (
+                task_message.message_id
+            )
+            elapsed = monotonic() - context.user_data["task_started_at"]
+            delay = max(0.0, bonus_target - elapsed)
+            context.user_data["bonus_reaction_task"] = (
+                context.application.create_task(
+                    expire_bonus_reaction(
+                        context,
+                        task_message.chat_id,
+                        task_message.message_id,
+                        context.user_data["task_id"],
+                        delay,
+                    ),
+                    name=f"bonus-reaction-{task_message.message_id}",
+                )
+            )
+
+
+async def expire_bonus_reaction(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    task_id: int,
+    delay: float,
+) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await context.bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[],
+        )
+    except asyncio.CancelledError:
+        return
+    except TelegramError:
+        logging.warning(
+            "Could not remove the expired bonus reaction",
+            exc_info=True,
+        )
+    finally:
+        if context.user_data.get("task_id") == task_id:
+            context.user_data.pop("bonus_reaction_task", None)
+            context.user_data.pop("bonus_reaction_chat_id", None)
+            context.user_data.pop("bonus_reaction_message_id", None)
+
+
+async def clear_bonus_reaction(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    reaction_task = context.user_data.pop("bonus_reaction_task", None)
+    if reaction_task is not None and not reaction_task.done():
+        reaction_task.cancel()
+
+    chat_id = context.user_data.pop("bonus_reaction_chat_id", None)
+    message_id = context.user_data.pop(
+        "bonus_reaction_message_id", None
+    )
+    if chat_id is None or message_id is None:
+        return
+
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[],
+        )
+    except TelegramError:
+        logging.warning(
+            "Could not clear the bonus reaction",
+            exc_info=True,
+        )
 
 
 async def celebrate_correct(
@@ -419,6 +499,7 @@ async def save_answer(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await clear_bonus_reaction(context)
     context.user_data.clear()
     try:
         progress = await database.get_progress(update.effective_user)
@@ -439,6 +520,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def skip_task(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    await clear_bonus_reaction(context)
     previous_answer = context.user_data.get("answer")
 
     if previous_answer is None:
@@ -468,6 +550,7 @@ async def handle_message(
         await update.message.reply_text("Введи число 😊")
         return
 
+    await clear_bonus_reaction(context)
     is_correct, event = await save_answer(
         update.effective_user, context, text
     )
@@ -495,6 +578,7 @@ async def handle_answer_button(
 
     await query.answer()
 
+    await clear_bonus_reaction(context)
     is_correct, event = await save_answer(
         query.from_user, context, selected_answer
     )
