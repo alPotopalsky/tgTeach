@@ -138,7 +138,7 @@ MATH_TOPIC_BY_MODE = {
     "div_large": "division",
 }
 ENGLISH_WORDS_TOPIC = "basic_words"
-INTERESTING_ROUTE_LENGTH = 3
+INTERESTING_ROUTE_MAX_STEPS = 6
 INTERESTING_BUTTON_TEXT = "✨ Щось цікаве"
 INTERESTING_OFFER_MIN_SECONDS = 15
 INTERESTING_OFFER_MAX_SECONDS = 30
@@ -859,6 +859,15 @@ def interesting_keyboard(
     )
 
 
+def interesting_answer_feedback(
+    is_correct: bool,
+    explanation: str,
+) -> str:
+    if is_correct:
+        return f"✅\n\n{explanation}"
+    return "🤔"
+
+
 async def send_interesting_question(
     message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -927,7 +936,7 @@ async def start_interesting_route(
     await clear_interesting_offer(context)
     await clear_bonus_reaction(context)
     context.user_data["interesting_steps_remaining"] = (
-        INTERESTING_ROUTE_LENGTH
+        INTERESTING_ROUTE_MAX_STEPS
     )
     try:
         sent = await send_interesting_question(
@@ -991,13 +1000,10 @@ async def handle_interesting_answer(
         logging.exception("Could not save an interesting answer")
 
     explanation = context.user_data["interesting_explanation"]
-    if is_correct:
-        feedback = f"✅\n\n{explanation}"
-    else:
-        feedback = (
-            f"❌ Правильна відповідь: {correct_answer}\n\n"
-            f"{explanation}"
-        )
+    feedback = interesting_answer_feedback(
+        is_correct,
+        explanation,
+    )
     await query.edit_message_text(
         f"✨ {context.user_data['interesting_prompt']}\n\n"
         f"{feedback}"
