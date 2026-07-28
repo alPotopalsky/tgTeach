@@ -48,6 +48,22 @@ MAIN_SCHEMA = [
     CREATE INDEX IF NOT EXISTS user_subject_progress_subject_idx
     ON user_subject_progress (subject, level)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS user_topic_cooldowns (
+        telegram_user_id BIGINT NOT NULL
+            REFERENCES bot_users (telegram_user_id) ON DELETE CASCADE,
+        subject TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        blocked_until TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (telegram_user_id, subject, topic)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS user_topic_cooldowns_expiry_idx
+    ON user_topic_cooldowns (blocked_until)
+    """,
 ]
 
 LOG_SCHEMA = [
@@ -92,6 +108,27 @@ LOG_SCHEMA = [
     CREATE INDEX IF NOT EXISTS answer_logs_answered_at_idx
     ON answer_logs (answered_at)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS topic_feedback_logs (
+        id BIGSERIAL PRIMARY KEY,
+        telegram_user_id BIGINT NOT NULL
+            REFERENCES log_users (telegram_user_id) ON DELETE CASCADE,
+        subject TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        expression TEXT NOT NULL,
+        action TEXT NOT NULL,
+        blocked_until TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS topic_feedback_logs_user_time_idx
+    ON topic_feedback_logs (telegram_user_id, created_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS topic_feedback_logs_created_at_idx
+    ON topic_feedback_logs (created_at)
+    """,
 ]
 
 UPSERT_USER = """
@@ -130,7 +167,8 @@ def empty_progress() -> dict[str, dict[str, dict[str, Any]]]:
     return {
         "subjects": {
             subject: empty_subject_progress() for subject in SUBJECTS
-        }
+        },
+        "blocked_topics": {},
     }
 
 
@@ -391,8 +429,23 @@ async def _load_subject_rows(connection, user_id: int) -> dict[str, Any]:
         (user_id,),
     )
     rows = await cursor.fetchall()
+    cooldown_cursor = await connection.execute(
+        """
+        SELECT
+            subject || ':' || topic,
+            EXTRACT(EPOCH FROM blocked_until)
+        FROM user_topic_cooldowns
+        WHERE telegram_user_id = %s
+          AND blocked_until > NOW()
+        """,
+        (user_id,),
+    )
+    cooldown_rows = await cooldown_cursor.fetchall()
     return {
-        "subjects": {row[0]: _subject_from_row(row) for row in rows}
+        "subjects": {row[0]: _subject_from_row(row) for row in rows},
+        "blocked_topics": {
+            row[0]: float(row[1]) for row in cooldown_rows
+        },
     }
 
 
@@ -407,6 +460,98 @@ async def get_progress(user: Any) -> dict[str, Any]:
             progress = await _load_subject_rows(connection, user.id)
 
     return progress
+
+
+async def block_topic(
+    *,
+    user: Any,
+    subject: str,
+    topic: str,
+    expression: str,
+    hours: int = 24,
+) -> float:
+    if _progress_pool is None:
+        raise RuntimeError("Progress database is not connected")
+
+    async with _progress_pool.connection() as connection:
+        async with connection.transaction():
+            await _upsert_user(connection, user)
+            cursor = await connection.execute(
+                """
+                INSERT INTO user_topic_cooldowns (
+                    telegram_user_id,
+                    subject,
+                    topic,
+                    blocked_until
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    NOW() + (%s * INTERVAL '1 hour')
+                )
+                ON CONFLICT (telegram_user_id, subject, topic)
+                DO UPDATE SET
+                    blocked_until = EXCLUDED.blocked_until,
+                    updated_at = NOW()
+                RETURNING
+                    blocked_until,
+                    EXTRACT(EPOCH FROM blocked_until)
+                """,
+                (user.id, subject, topic, hours),
+            )
+            row = await cursor.fetchone()
+
+    if _log_pool is not None:
+        try:
+            async with _log_pool.connection() as connection:
+                async with connection.transaction():
+                    await connection.execute(
+                        """
+                        INSERT INTO log_users (
+                            telegram_user_id,
+                            username,
+                            first_name,
+                            last_name
+                        )
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (telegram_user_id) DO UPDATE SET
+                            username = EXCLUDED.username,
+                            first_name = EXCLUDED.first_name,
+                            last_name = EXCLUDED.last_name,
+                            updated_at = NOW()
+                        """,
+                        (
+                            user.id,
+                            user.username,
+                            user.first_name,
+                            user.last_name,
+                        ),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO topic_feedback_logs (
+                            telegram_user_id,
+                            subject,
+                            topic,
+                            expression,
+                            action,
+                            blocked_until
+                        )
+                        VALUES (%s, %s, %s, %s, 'bored', %s)
+                        """,
+                        (
+                            user.id,
+                            subject,
+                            topic,
+                            expression,
+                            row[0],
+                        ),
+                    )
+        except Exception:
+            logging.exception("Could not save topic feedback log")
+
+    return float(row[1])
 
 
 async def _save_log(

@@ -4,7 +4,7 @@ import logging
 import os
 import random
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
@@ -110,30 +110,57 @@ ENGLISH_WORDS = [
     (9, "science", "наука"),
 ]
 
+MATH_TOPIC_BY_MODE = {
+    "add_tiny": "addition",
+    "add1": "addition",
+    "add2_small": "addition",
+    "add2": "addition",
+    "add3": "addition",
+    "add_large": "addition",
+    "sub1": "subtraction",
+    "sub2_small": "subtraction",
+    "sub2": "subtraction",
+    "sub3": "subtraction",
+    "sub_large": "subtraction",
+    "mul_tiny": "multiplication",
+    "mul_easy": "multiplication",
+    "mul": "multiplication",
+    "mul_large": "multiplication",
+    "div_easy": "division",
+    "div_large": "division",
+}
+ENGLISH_WORDS_TOPIC = "basic_words"
+TOPIC_COOLDOWN_HOURS = 24
 
-def generate_task(level: int = 0) -> tuple[str, int]:
+
+def math_modes_for_level(level: int) -> list[str]:
     if level == 0:
-        mode = "add_tiny"
-    elif level == 1:
-        mode = random.choice(["add1", "sub1"])
-    elif level == 2:
-        mode = random.choice(["add2_small", "sub2_small"])
-    elif level == 3:
-        mode = random.choice(["add2_small", "sub2_small", "mul_tiny"])
-    elif level == 4:
-        mode = random.choice(["add2", "sub2", "mul_easy"])
-    elif level == 5:
-        mode = random.choice(["add2", "sub2", "mul"])
-    elif level == 6:
-        mode = random.choice(["add2", "sub2", "mul", "div_easy"])
-    elif level == 7:
-        mode = random.choice(["add3", "sub3", "mul"])
-    elif level == 8:
-        mode = random.choice(["add3", "sub3", "mul_large", "div_large"])
-    else:
-        mode = random.choice(
-            ["add_large", "sub_large", "mul_large", "div_large"]
-        )
+        return ["add_tiny"]
+    if level == 1:
+        return ["add1", "sub1"]
+    if level == 2:
+        return ["add2_small", "sub2_small"]
+    if level == 3:
+        return ["add2_small", "sub2_small", "mul_tiny"]
+    if level == 4:
+        return ["add2", "sub2", "mul_easy"]
+    if level == 5:
+        return ["add2", "sub2", "mul"]
+    if level == 6:
+        return ["add2", "sub2", "mul", "div_easy"]
+    if level == 7:
+        return ["add3", "sub3", "mul"]
+    if level == 8:
+        return ["add3", "sub3", "mul_large", "div_large"]
+    return ["add_large", "sub_large", "mul_large", "div_large"]
+
+
+def generate_task(
+    level: int = 0,
+    available_modes: list[str] | None = None,
+) -> tuple[str, int, str]:
+    modes = available_modes or math_modes_for_level(level)
+    mode = random.choice(modes)
 
     if mode == "add_tiny":
         a, b = random.randint(1, 5), random.randint(1, 5)
@@ -217,7 +244,7 @@ def generate_task(level: int = 0) -> tuple[str, int]:
         operator = "×"
         answer = a * b
 
-    return f"{a} {operator} {b}", answer
+    return f"{a} {operator} {b}", answer, MATH_TOPIC_BY_MODE[mode]
 
 
 def generate_choices(answer: int, count: int) -> list[int]:
@@ -257,7 +284,9 @@ def generate_english_task(
 
 
 def answer_keyboard(
-    choices: list[int | str], task_id: int
+    choices: list[int | str],
+    task_id: int,
+    allow_topic_cooldown: bool,
 ) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(
@@ -270,7 +299,32 @@ def answer_keyboard(
         buttons[index : index + row_size]
         for index in range(0, len(buttons), row_size)
     ]
+    if allow_topic_cooldown:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🥱 Набридло",
+                    callback_data=f"bored:{task_id}",
+                )
+            ]
+        )
     return InlineKeyboardMarkup(rows)
+
+
+def active_blocked_topics(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> dict[str, float]:
+    now = time()
+    blocked_topics = context.user_data.setdefault(
+        "blocked_topics", {}
+    )
+    active = {
+        key: float(blocked_until)
+        for key, blocked_until in blocked_topics.items()
+        if float(blocked_until) > now
+    }
+    context.user_data["blocked_topics"] = active
+    return active
 
 
 def set_new_task(
@@ -292,18 +346,37 @@ def set_new_task(
         min(math_progress["level"], MATH_LEVEL_COUNT),
     )
     english_interval = max(3, 5 - min((english_level - 1) // 3, 2))
+    blocked_topics = active_blocked_topics(context)
+    math_modes = [
+        mode
+        for mode in math_modes_for_level(math_level - 1)
+        if f"math:{MATH_TOPIC_BY_MODE[mode]}" not in blocked_topics
+    ]
+    english_topic_key = f"english:{ENGLISH_WORDS_TOPIC}"
+    english_available = english_topic_key not in blocked_topics
 
-    if task_number % english_interval == 0:
+    if not math_modes and not english_available:
+        blocked_topics.clear()
+        math_modes = math_modes_for_level(math_level - 1)
+        english_available = True
+
+    prefer_english = task_number % english_interval == 0
+
+    if prefer_english and english_available or not math_modes:
         choice_count = min(3 + (english_level - 1) // 3, 6)
         question, answer, choices = generate_english_task(
             english_level - 1, choice_count
         )
         subject = "english"
+        topic = ENGLISH_WORDS_TOPIC
         task_level = english_level
         subject_progress = english_progress
     else:
         choice_count = min(3 + (math_level - 1) // 3, 6)
-        expression, numeric_answer = generate_task(math_level - 1)
+        expression, numeric_answer, topic = generate_task(
+            math_level - 1,
+            math_modes,
+        )
         question = f"{expression} = ?"
         answer = str(numeric_answer)
         choices = [
@@ -315,11 +388,19 @@ def set_new_task(
         task_level = math_level
         subject_progress = math_progress
 
+    available_topic_keys = {
+        f"math:{MATH_TOPIC_BY_MODE[mode]}" for mode in math_modes
+    }
+    if english_available:
+        available_topic_keys.add(english_topic_key)
+    allow_topic_cooldown = len(available_topic_keys) > 1
+
     context.user_data["answer"] = answer.casefold()
     context.user_data["task_id"] = task_id
     context.user_data["task_number"] = task_number
     context.user_data["task_expression"] = question
     context.user_data["task_type"] = subject
+    context.user_data["task_topic"] = topic
     context.user_data["task_level"] = task_level
     context.user_data["task_choice_count"] = choice_count
     context.user_data["task_attempts"] = 0
@@ -328,7 +409,7 @@ def set_new_task(
 
     return (
         question,
-        answer_keyboard(choices, task_id),
+        answer_keyboard(choices, task_id, allow_topic_cooldown),
         task_level,
         choice_count,
         bonus_target,
@@ -534,6 +615,46 @@ async def skip_task(
     await send_new_task(update.message, context, prefix)
 
 
+async def handle_bored_button(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    _, task_id_text = query.data.split(":", 1)
+    task_id = int(task_id_text)
+
+    if task_id != context.user_data.get("task_id"):
+        await query.answer("Це завдання вже завершено 😊")
+        return
+
+    await query.answer("Відклали цю тему на добу 👌")
+    await clear_bonus_reaction(context)
+
+    subject = context.user_data["task_type"]
+    topic = context.user_data["task_topic"]
+    topic_key = f"{subject}:{topic}"
+    blocked_until = time() + TOPIC_COOLDOWN_HOURS * 60 * 60
+
+    if database.is_enabled():
+        try:
+            blocked_until = await database.block_topic(
+                user=query.from_user,
+                subject=subject,
+                topic=topic,
+                expression=context.user_data["task_expression"],
+                hours=TOPIC_COOLDOWN_HOURS,
+            )
+        except Exception:
+            logging.exception(
+                "Could not save topic cooldown; using memory fallback"
+            )
+
+    context.user_data.setdefault("blocked_topics", {})[
+        topic_key
+    ] = blocked_until
+    await query.edit_message_reply_markup(reply_markup=None)
+    await send_new_task(query.message, context)
+
+
 async def handle_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -612,6 +733,9 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("skip", skip_task))
+    app.add_handler(
+        CallbackQueryHandler(handle_bored_button, pattern=r"^bored:")
+    )
     app.add_handler(
         CallbackQueryHandler(handle_answer_button, pattern=r"^answer:")
     )
