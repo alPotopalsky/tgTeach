@@ -36,6 +36,8 @@ def load_bot_token() -> str:
 
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 CORRECT_EMOJIS = ["🎉", "🥳", "🤩", "🏆", "🚀", "🌟"]
 WRONG_EMOJIS = ["😅", "🙈", "🤔", "🫠", "🥲", "🧐"]
