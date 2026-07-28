@@ -6,7 +6,13 @@ import random
 from pathlib import Path
 from time import monotonic
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -133,6 +139,11 @@ MATH_TOPIC_BY_MODE = {
 }
 ENGLISH_WORDS_TOPIC = "basic_words"
 INTERESTING_ROUTE_LENGTH = 3
+INTERESTING_BUTTON_TEXT = "✨ Щось цікаве"
+INTERESTING_OFFER_MIN_SECONDS = 15
+INTERESTING_OFFER_MAX_SECONDS = 30
+INTERESTING_OFFER_WRONG_STEP_SECONDS = 3
+MIN_BUBBLE_FILLER = "\u2800" * 18
 WARMUP_RESET_SECONDS = 10 * 60
 WARMUP_INITIAL_TARGET_SECONDS = 15
 WARMUP_MIDDLE_TARGET_SECONDS = 10
@@ -305,15 +316,13 @@ def answer_keyboard(
         buttons[index : index + row_size]
         for index in range(0, len(buttons), row_size)
     ]
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "✨ Щось цікаве",
-                callback_data=f"interesting:{task_id}",
-            )
-        ]
-    )
     return InlineKeyboardMarkup(rows)
+
+
+def widen_short_message(text: str) -> str:
+    if max(len(line) for line in text.splitlines()) >= 18:
+        return text
+    return f"{text}\n{MIN_BUBBLE_FILLER}"
 
 
 def adaptive_bonus_target(
@@ -331,6 +340,145 @@ def adaptive_bonus_target(
             personal_target or WARMUP_MIDDLE_TARGET_SECONDS,
         )
     return personal_target or WARMUP_MIDDLE_TARGET_SECONDS
+
+
+def interesting_offer_delay(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    expected_seconds = context.user_data.get(
+        "task_bonus_target_seconds",
+        WARMUP_INITIAL_TARGET_SECONDS,
+    )
+    wrong_attempts = min(
+        context.user_data.get("task_attempts", 0),
+        3,
+    )
+    predicted_delay = (
+        expected_seconds * 2
+        - wrong_attempts * INTERESTING_OFFER_WRONG_STEP_SECONDS
+    )
+    return max(
+        INTERESTING_OFFER_MIN_SECONDS,
+        min(INTERESTING_OFFER_MAX_SECONDS, round(predicted_delay)),
+    )
+
+
+def cancel_interesting_offer(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    offer_task = context.user_data.pop(
+        "interesting_offer_task",
+        None,
+    )
+    if offer_task is not None and not offer_task.done():
+        offer_task.cancel()
+
+
+async def show_interesting_offer_after_pause(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    task_id: int,
+    delay: int,
+) -> None:
+    try:
+        await asyncio.sleep(delay)
+        if (
+            context.user_data.get("task_id") != task_id
+            or "interesting_question_id" in context.user_data
+        ):
+            return
+        offer_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text="✨",
+            reply_markup=ReplyKeyboardMarkup(
+                [[INTERESTING_BUTTON_TEXT]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+                input_field_placeholder="Можна трохи перемкнутися",
+            ),
+        )
+        context.user_data["interesting_offer_message_id"] = (
+            offer_message.message_id
+        )
+        context.user_data["interesting_offer_visible"] = True
+    except asyncio.CancelledError:
+        return
+    except TelegramError:
+        logging.warning(
+            "Could not show the interesting-question offer",
+            exc_info=True,
+        )
+    finally:
+        current_task = context.user_data.get("interesting_offer_task")
+        if current_task is asyncio.current_task():
+            context.user_data.pop("interesting_offer_task", None)
+
+
+def schedule_interesting_offer(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    cancel_interesting_offer(context)
+    chat_id = context.user_data.get("task_message_chat_id")
+    message_id = context.user_data.get("task_message_id")
+    task_id = context.user_data.get("task_id")
+    if chat_id is None or message_id is None or task_id is None:
+        return
+
+    delay = interesting_offer_delay(context)
+    context.user_data["interesting_offer_task"] = (
+        context.application.create_task(
+            show_interesting_offer_after_pause(
+                context,
+                chat_id,
+                message_id,
+                task_id,
+                delay,
+            ),
+            name=f"interesting-offer-{message_id}",
+        )
+    )
+
+
+async def clear_interesting_offer(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    cancel_interesting_offer(context)
+    was_visible = context.user_data.pop(
+        "interesting_offer_visible",
+        False,
+    )
+    offer_message_id = context.user_data.pop(
+        "interesting_offer_message_id",
+        None,
+    )
+    if not was_visible:
+        return
+
+    chat_id = context.user_data.get("task_message_chat_id")
+    if chat_id is None:
+        return
+
+    try:
+        control_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text="\u2063",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await context.bot.delete_message(
+            chat_id=chat_id,
+            message_id=control_message.message_id,
+        )
+        if offer_message_id is not None:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=offer_message_id,
+            )
+    except TelegramError:
+        logging.warning(
+            "Could not hide the interesting-question offer",
+            exc_info=True,
+        )
 
 
 def set_new_task(
@@ -389,6 +537,7 @@ def set_new_task(
     context.user_data["task_topic"] = topic
     context.user_data["task_level"] = task_level
     context.user_data["task_choice_count"] = choice_count
+    context.user_data["task_choices"] = list(choices)
     context.user_data["task_attempts"] = 0
     context.user_data.pop("last_wrong_emoji", None)
     bonus_target = adaptive_bonus_target(context, subject_progress)
@@ -406,12 +555,17 @@ def set_new_task(
 async def send_new_task(
     message, context: ContextTypes.DEFAULT_TYPE, prefix: str = ""
 ) -> None:
+    cancel_interesting_offer(context)
     question, keyboard, _, _, bonus_target = set_new_task(context)
     heading = f"{prefix}\n\n" if prefix else ""
-    task_text = f"{heading}{question}"
+    task_text = widen_short_message(f"{heading}{question}")
     context.user_data["task_text"] = task_text
     task_message = await message.reply_text(task_text, reply_markup=keyboard)
     context.user_data["task_started_at"] = monotonic()
+    context.user_data["task_message_chat_id"] = task_message.chat_id
+    context.user_data["task_message_id"] = task_message.message_id
+    context.user_data["interesting_offer_visible"] = False
+    schedule_interesting_offer(context)
 
     if bonus_target is not None:
         try:
@@ -620,6 +774,7 @@ def update_warmup_state(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await clear_bonus_reaction(context)
+    await clear_interesting_offer(context)
     previous_answered_at = context.user_data.get(
         "warmup_last_answered_at"
     )
@@ -656,6 +811,7 @@ async def skip_task(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     await clear_bonus_reaction(context)
+    await clear_interesting_offer(context)
     clear_interesting_state(context)
     previous_answer = context.user_data.get("answer")
 
@@ -755,16 +911,29 @@ async def handle_interesting_button(
         return
 
     await query.answer()
-    await clear_bonus_reaction(context)
+    await start_interesting_route(
+        query.message,
+        query.from_user,
+        context,
+    )
     await query.edit_message_reply_markup(reply_markup=None)
+
+
+async def start_interesting_route(
+    message,
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await clear_interesting_offer(context)
+    await clear_bonus_reaction(context)
     context.user_data["interesting_steps_remaining"] = (
         INTERESTING_ROUTE_LENGTH
     )
     try:
         sent = await send_interesting_question(
-            query.message,
+            message,
             context,
-            user_id=query.from_user.id,
+            user_id=user.id,
         )
     except Exception:
         logging.exception("Could not load an interesting question")
@@ -772,7 +941,7 @@ async def handle_interesting_button(
 
     if not sent:
         clear_interesting_state(context)
-        await send_new_task(query.message, context)
+        await send_new_task(message, context)
 
 
 async def handle_interesting_answer(
@@ -871,6 +1040,14 @@ async def handle_message(
         await update.message.reply_text("Обери варіант кнопкою 😊")
         return
 
+    if text == INTERESTING_BUTTON_TEXT:
+        await start_interesting_route(
+            update.message,
+            update.effective_user,
+            context,
+        )
+        return
+
     if "answer" not in context.user_data:
         await update.message.reply_text("Напиши /start, щоб почати.")
         return
@@ -879,10 +1056,14 @@ async def handle_message(
         context.user_data["task_type"] == "math"
         and not text.replace("-", "", 1).isdigit()
     ):
+        await clear_bonus_reaction(context)
+        await clear_interesting_offer(context)
         await update.message.reply_text("Введи число 😊")
+        schedule_interesting_offer(context)
         return
 
     await clear_bonus_reaction(context)
+    await clear_interesting_offer(context)
     is_correct, event = await save_answer(
         update.effective_user, context, text
     )
@@ -894,6 +1075,7 @@ async def handle_message(
         return
 
     await encourage_retry(update.message)
+    schedule_interesting_offer(context)
 
 
 async def handle_answer_button(
@@ -911,6 +1093,7 @@ async def handle_answer_button(
     await query.answer()
 
     await clear_bonus_reaction(context)
+    await clear_interesting_offer(context)
     is_correct, event = await save_answer(
         query.from_user, context, selected_answer
     )
@@ -929,8 +1112,12 @@ async def handle_answer_button(
     context.user_data["last_wrong_emoji"] = emoji
     await query.edit_message_text(
         f"{context.user_data['task_text']}\n\n{emoji}",
-        reply_markup=query.message.reply_markup,
+        reply_markup=answer_keyboard(
+            context.user_data["task_choices"],
+            task_id,
+        ),
     )
+    schedule_interesting_offer(context)
 
 
 def main() -> None:
