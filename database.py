@@ -130,6 +130,41 @@ MAIN_SCHEMA = [
         PRIMARY KEY (telegram_user_id, question_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS user_session_profiles (
+        telegram_user_id BIGINT PRIMARY KEY
+            REFERENCES bot_users (telegram_user_id) ON DELETE CASCADE,
+        focus_block_seconds SMALLINT NOT NULL DEFAULT 480
+            CHECK (focus_block_seconds BETWEEN 300 AND 720),
+        sessions_observed INTEGER NOT NULL DEFAULT 0,
+        recent_outcomes TEXT[] NOT NULL DEFAULT '{}',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS learning_sessions (
+        id BIGSERIAL PRIMARY KEY,
+        telegram_user_id BIGINT NOT NULL
+            REFERENCES bot_users (telegram_user_id) ON DELETE CASCADE,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        active_seconds INTEGER NOT NULL DEFAULT 0,
+        focus_block_seconds SMALLINT NOT NULL,
+        completed_blocks SMALLINT NOT NULL DEFAULT 0,
+        level_advances SMALLINT NOT NULL DEFAULT 0,
+        ended_at TIMESTAMPTZ,
+        end_reason TEXT
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS learning_sessions_one_open_idx
+    ON learning_sessions (telegram_user_id)
+    WHERE ended_at IS NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS learning_sessions_user_time_idx
+    ON learning_sessions (telegram_user_id, started_at DESC)
+    """,
 ]
 
 LOG_SCHEMA = [
@@ -1097,6 +1132,267 @@ async def record_content_answer(
                     )
         except Exception:
             logging.exception("Could not save content answer log")
+
+
+async def record_session_activity(
+    *,
+    user: Any,
+    active_seconds: int,
+    level_advance: bool = False,
+) -> dict[str, Any] | None:
+    if _progress_pool is None:
+        return None
+
+    active_seconds = max(0, min(20, int(active_seconds)))
+    async with _progress_pool.connection() as connection:
+        async with connection.transaction():
+            await _upsert_user(connection, user)
+            await connection.execute(
+                """
+                INSERT INTO user_session_profiles (telegram_user_id)
+                VALUES (%s)
+                ON CONFLICT (telegram_user_id) DO NOTHING
+                """,
+                (user.id,),
+            )
+            cursor = await connection.execute(
+                """
+                SELECT
+                    id,
+                    active_seconds,
+                    focus_block_seconds,
+                    completed_blocks,
+                    level_advances,
+                    last_activity_at < NOW() - INTERVAL '10 minutes'
+                FROM learning_sessions
+                WHERE telegram_user_id = %s
+                  AND ended_at IS NULL
+                FOR UPDATE
+                """,
+                (user.id,),
+            )
+            row = await cursor.fetchone()
+
+            if row is not None and row[5]:
+                await connection.execute(
+                    """
+                    UPDATE learning_sessions
+                    SET ended_at = NOW(), end_reason = 'inactivity'
+                    WHERE id = %s
+                    """,
+                    (row[0],),
+                )
+                row = None
+
+            if row is None:
+                profile_cursor = await connection.execute(
+                    """
+                    SELECT focus_block_seconds
+                    FROM user_session_profiles
+                    WHERE telegram_user_id = %s
+                    """,
+                    (user.id,),
+                )
+                block_seconds = int((await profile_cursor.fetchone())[0])
+                cursor = await connection.execute(
+                    """
+                    INSERT INTO learning_sessions (
+                        telegram_user_id,
+                        focus_block_seconds
+                    )
+                    VALUES (%s, %s)
+                    RETURNING
+                        id,
+                        active_seconds,
+                        focus_block_seconds,
+                        completed_blocks,
+                        level_advances,
+                        FALSE
+                    """,
+                    (user.id, block_seconds),
+                )
+                row = await cursor.fetchone()
+
+            (
+                session_id,
+                previous_active_seconds,
+                block_seconds,
+                previous_completed_blocks,
+                previous_level_advances,
+                _,
+            ) = row
+            new_active_seconds = int(previous_active_seconds) + active_seconds
+            new_completed_blocks = new_active_seconds // int(block_seconds)
+            new_level_advances = int(previous_level_advances) + int(
+                level_advance
+            )
+            await connection.execute(
+                """
+                UPDATE learning_sessions
+                SET
+                    active_seconds = %s,
+                    completed_blocks = %s,
+                    level_advances = %s,
+                    last_activity_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    new_active_seconds,
+                    new_completed_blocks,
+                    new_level_advances,
+                    session_id,
+                ),
+            )
+
+    return {
+        "session_id": int(session_id),
+        "active_seconds": new_active_seconds,
+        "focus_block_seconds": int(block_seconds),
+        "completed_blocks": int(new_completed_blocks),
+        "new_block_completed": (
+            new_completed_blocks > int(previous_completed_blocks)
+        ),
+        "level_advances": new_level_advances,
+    }
+
+
+async def end_learning_session(
+    user_id: int,
+    reason: str,
+) -> dict[str, Any] | None:
+    if _progress_pool is None:
+        return None
+
+    async with _progress_pool.connection() as connection:
+        async with connection.transaction():
+            cursor = await connection.execute(
+                """
+                SELECT
+                    id,
+                    active_seconds,
+                    focus_block_seconds,
+                    completed_blocks,
+                    level_advances
+                FROM learning_sessions
+                WHERE telegram_user_id = %s
+                  AND ended_at IS NULL
+                FOR UPDATE
+                """,
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+
+            (
+                session_id,
+                active_seconds,
+                block_seconds,
+                completed_blocks,
+                level_advances,
+            ) = row
+            await connection.execute(
+                """
+                UPDATE learning_sessions
+                SET ended_at = NOW(), end_reason = %s
+                WHERE id = %s
+                """,
+                (reason, session_id),
+            )
+
+            profile_cursor = await connection.execute(
+                """
+                SELECT recent_outcomes
+                FROM user_session_profiles
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (user_id,),
+            )
+            profile_row = await profile_cursor.fetchone()
+            recent_outcomes = list(profile_row[0] or []) if profile_row else []
+            if int(completed_blocks) >= 3:
+                outcome = "stable"
+            elif int(active_seconds) < int(block_seconds):
+                outcome = "early"
+            else:
+                outcome = "partial"
+            recent_outcomes = (recent_outcomes + [outcome])[-3:]
+
+            new_block_seconds = int(block_seconds)
+            if recent_outcomes[-2:] == ["early", "early"]:
+                new_block_seconds = max(300, new_block_seconds - 60)
+                recent_outcomes = []
+            elif recent_outcomes[-2:] == ["stable", "stable"]:
+                new_block_seconds = min(720, new_block_seconds + 60)
+                recent_outcomes = []
+
+            await connection.execute(
+                """
+                UPDATE user_session_profiles
+                SET
+                    focus_block_seconds = %s,
+                    sessions_observed = sessions_observed + 1,
+                    recent_outcomes = %s,
+                    updated_at = NOW()
+                WHERE telegram_user_id = %s
+                """,
+                (new_block_seconds, recent_outcomes, user_id),
+            )
+
+    return {
+        "session_id": int(session_id),
+        "active_seconds": int(active_seconds),
+        "focus_block_seconds": int(block_seconds),
+        "completed_blocks": int(completed_blocks),
+        "level_advances": int(level_advances),
+        "next_focus_block_seconds": new_block_seconds,
+    }
+
+
+async def get_learning_summary(user_id: int) -> dict[str, Any] | None:
+    if _progress_pool is None:
+        return None
+
+    async with _progress_pool.connection() as connection:
+        profile_cursor = await connection.execute(
+            """
+            SELECT focus_block_seconds
+            FROM user_session_profiles
+            WHERE telegram_user_id = %s
+            """,
+            (user_id,),
+        )
+        profile_row = await profile_cursor.fetchone()
+        session_cursor = await connection.execute(
+            """
+            SELECT
+                active_seconds,
+                focus_block_seconds,
+                completed_blocks,
+                level_advances
+            FROM learning_sessions
+            WHERE telegram_user_id = %s
+              AND ended_at IS NULL
+            """,
+            (user_id,),
+        )
+        session_row = await session_cursor.fetchone()
+
+    block_seconds = int(profile_row[0]) if profile_row else 480
+    if session_row is None:
+        return {
+            "active_seconds": 0,
+            "focus_block_seconds": block_seconds,
+            "completed_blocks": 0,
+            "level_advances": 0,
+        }
+    return {
+        "active_seconds": int(session_row[0]),
+        "focus_block_seconds": int(session_row[1]),
+        "completed_blocks": int(session_row[2]),
+        "level_advances": int(session_row[3]),
+    }
 
 
 async def block_topic(

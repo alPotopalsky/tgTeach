@@ -10,7 +10,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
 from telegram.error import TelegramError
@@ -140,6 +139,10 @@ MATH_TOPIC_BY_MODE = {
 ENGLISH_WORDS_TOPIC = "basic_words"
 INTERESTING_ROUTE_MAX_STEPS = 6
 INTERESTING_BUTTON_TEXT = "✨ Щось цікаве"
+PROGRESS_BUTTON_TEXT = "🌿 Мій прогрес"
+CONTINUE_BUTTON_TEXT = "▶️ Продовжити"
+REST_BUTTON_TEXT = "☕ Перепочити"
+END_SESSION_BUTTON_TEXT = "⏹ Закінчити"
 INTERESTING_OFFER_MIN_SECONDS = 15
 INTERESTING_OFFER_MAX_SECONDS = 30
 INTERESTING_OFFER_WRONG_STEP_SECONDS = 3
@@ -149,6 +152,38 @@ WARMUP_INITIAL_TARGET_SECONDS = 15
 WARMUP_MIDDLE_TARGET_SECONDS = 10
 WARMUP_MIDDLE_POINTS = 2
 WARMUP_COMPLETE_POINTS = 4
+SESSION_DEFAULT_BLOCK_SECONDS = 8 * 60
+SESSION_GOAL_BLOCKS = 3
+SESSION_INACTIVITY_SECONDS = 10 * 60
+SESSION_MAX_ANSWER_SECONDS = 20
+
+
+def active_session_keyboard(
+    checkpoint: bool = False,
+) -> ReplyKeyboardMarkup:
+    if checkpoint:
+        rows = [
+            [CONTINUE_BUTTON_TEXT, REST_BUTTON_TEXT],
+            [END_SESSION_BUTTON_TEXT, PROGRESS_BUTTON_TEXT],
+        ]
+    else:
+        rows = [
+            [PROGRESS_BUTTON_TEXT, REST_BUTTON_TEXT],
+            [END_SESSION_BUTTON_TEXT],
+        ]
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def idle_session_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[CONTINUE_BUTTON_TEXT, PROGRESS_BUTTON_TEXT]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def math_modes_for_level(level: int) -> list[str]:
@@ -392,7 +427,11 @@ async def show_interesting_offer_after_pause(
             chat_id=chat_id,
             text="✨",
             reply_markup=ReplyKeyboardMarkup(
-                [[INTERESTING_BUTTON_TEXT]],
+                [
+                    [INTERESTING_BUTTON_TEXT],
+                    [PROGRESS_BUTTON_TEXT, REST_BUTTON_TEXT],
+                    [END_SESSION_BUTTON_TEXT],
+                ],
                 resize_keyboard=True,
                 one_time_keyboard=True,
                 input_field_placeholder="Можна трохи перемкнутися",
@@ -463,7 +502,7 @@ async def clear_interesting_offer(
         control_message = await context.bot.send_message(
             chat_id=chat_id,
             text="\u2063",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=active_session_keyboard(),
         )
         await context.bot.delete_message(
             chat_id=chat_id,
@@ -562,6 +601,9 @@ async def send_new_task(
     context.user_data["task_text"] = task_text
     task_message = await message.reply_text(task_text, reply_markup=keyboard)
     context.user_data["task_started_at"] = monotonic()
+    context.user_data["session_interval_started_at"] = (
+        context.user_data["task_started_at"]
+    )
     context.user_data["task_message_chat_id"] = task_message.chat_id
     context.user_data["task_message_id"] = task_message.message_id
     context.user_data["interesting_offer_visible"] = False
@@ -653,13 +695,285 @@ async def clear_bonus_reaction(
         )
 
 
+def cancel_session_inactivity(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    inactivity_task = context.user_data.pop(
+        "session_inactivity_task",
+        None,
+    )
+    if (
+        inactivity_task is not None
+        and inactivity_task is not asyncio.current_task()
+        and not inactivity_task.done()
+    ):
+        inactivity_task.cancel()
+
+
+def session_progress_line(completed_blocks: int) -> str:
+    if completed_blocks >= SESSION_GOAL_BLOCKS:
+        return "🌿 🌿 🌳"
+    symbols = ["🌿"] * min(completed_blocks, SESSION_GOAL_BLOCKS)
+    if len(symbols) < SESSION_GOAL_BLOCKS:
+        symbols.append("🌱")
+    symbols.extend(["○"] * (SESSION_GOAL_BLOCKS - len(symbols)))
+    return " ".join(symbols)
+
+
+def active_minutes_text(active_seconds: int) -> str:
+    if active_seconds < 60:
+        return "менше хвилини"
+    minutes = max(1, round(active_seconds / 60))
+    return f"{minutes} хв"
+
+
+def format_session_summary(summary: dict) -> str:
+    completed_blocks = int(summary.get("completed_blocks", 0))
+    lines = [
+        "🌿 Гарна робота",
+        session_progress_line(completed_blocks),
+        f"Активний час: {active_minutes_text(summary.get('active_seconds', 0))}",
+    ]
+    if completed_blocks:
+        if completed_blocks == 1:
+            noun = "частину"
+        elif completed_blocks < 4:
+            noun = "частини"
+        else:
+            noun = "частин"
+        lines.append(f"Завершено: {completed_blocks} {noun}")
+    if summary.get("level_advances", 0):
+        lines.append("↗️ Завдання стали складнішими")
+    if completed_blocks == 0:
+        lines.append("🌱 Навіть короткий старт — це рух уперед")
+    return "\n".join(lines)
+
+
+async def set_session_keyboard(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    keyboard: ReplyKeyboardMarkup,
+) -> None:
+    try:
+        control_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text="\u2063",
+            reply_markup=keyboard,
+        )
+        await context.bot.delete_message(
+            chat_id=chat_id,
+            message_id=control_message.message_id,
+        )
+    except TelegramError:
+        logging.warning("Could not update the session keyboard", exc_info=True)
+
+
+async def disable_current_task(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    chat_id = context.user_data.get("task_message_chat_id")
+    message_id = context.user_data.get("task_message_id")
+    if chat_id is not None and message_id is not None:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+        except TelegramError:
+            pass
+    for key in (
+        "answer",
+        "task_started_at",
+        "session_interval_started_at",
+        "task_message_chat_id",
+        "task_message_id",
+    ):
+        context.user_data.pop(key, None)
+
+
+async def end_current_session(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    reason: str,
+) -> dict | None:
+    cancel_session_inactivity(context)
+    summary = None
+    try:
+        summary = await database.end_learning_session(user_id, reason)
+    except Exception:
+        logging.exception("Could not finish the learning session")
+
+    if summary is None and "session_active_seconds" in context.user_data:
+        summary = {
+            "active_seconds": context.user_data.get(
+                "session_active_seconds", 0
+            ),
+            "focus_block_seconds": context.user_data.get(
+                "session_focus_block_seconds",
+                SESSION_DEFAULT_BLOCK_SECONDS,
+            ),
+            "completed_blocks": context.user_data.get(
+                "session_completed_blocks", 0
+            ),
+            "level_advances": context.user_data.get(
+                "session_level_advances", 0
+            ),
+        }
+
+    for key in (
+        "session_active_seconds",
+        "session_focus_block_seconds",
+        "session_completed_blocks",
+        "session_level_advances",
+    ):
+        context.user_data.pop(key, None)
+    return summary
+
+
+async def finish_session_after_inactivity(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+) -> None:
+    try:
+        await asyncio.sleep(SESSION_INACTIVITY_SECONDS)
+        await clear_bonus_reaction(context)
+        await clear_interesting_offer(context)
+        clear_interesting_state(context)
+        summary = await end_current_session(
+            context,
+            user_id,
+            "inactivity",
+        )
+        await disable_current_task(context)
+        if summary is not None:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{format_session_summary(summary)}\n\n"
+                "Можна відпочити й повернутися пізніше ☕",
+                reply_markup=idle_session_keyboard(),
+            )
+    except asyncio.CancelledError:
+        return
+    except TelegramError:
+        logging.warning(
+            "Could not show the inactivity summary",
+            exc_info=True,
+        )
+    finally:
+        current_task = context.user_data.get("session_inactivity_task")
+        if current_task is asyncio.current_task():
+            context.user_data.pop("session_inactivity_task", None)
+
+
+def schedule_session_inactivity(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+) -> None:
+    cancel_session_inactivity(context)
+    context.user_data["session_inactivity_task"] = (
+        context.application.create_task(
+            finish_session_after_inactivity(
+                context,
+                user_id,
+                chat_id,
+            ),
+            name=f"session-inactivity-{user_id}",
+        )
+    )
+
+
+async def track_session_activity(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    active_seconds: int,
+    level_advance: bool = False,
+) -> dict:
+    previous_blocks = context.user_data.get("session_completed_blocks", 0)
+    summary = None
+    try:
+        summary = await database.record_session_activity(
+            user=user,
+            active_seconds=active_seconds,
+            level_advance=level_advance,
+        )
+    except Exception:
+        logging.exception("Could not save learning-session activity")
+
+    if summary is None:
+        block_seconds = context.user_data.get(
+            "session_focus_block_seconds",
+            SESSION_DEFAULT_BLOCK_SECONDS,
+        )
+        total_seconds = (
+            context.user_data.get("session_active_seconds", 0)
+            + active_seconds
+        )
+        completed_blocks = total_seconds // block_seconds
+        summary = {
+            "active_seconds": total_seconds,
+            "focus_block_seconds": block_seconds,
+            "completed_blocks": completed_blocks,
+            "new_block_completed": completed_blocks > previous_blocks,
+            "level_advances": (
+                context.user_data.get("session_level_advances", 0)
+                + int(level_advance)
+            ),
+        }
+
+    context.user_data["session_active_seconds"] = summary["active_seconds"]
+    context.user_data["session_focus_block_seconds"] = summary[
+        "focus_block_seconds"
+    ]
+    context.user_data["session_completed_blocks"] = summary[
+        "completed_blocks"
+    ]
+    context.user_data["session_level_advances"] = summary[
+        "level_advances"
+    ]
+    schedule_session_inactivity(context, user.id, chat_id)
+    return summary
+
+
+async def show_session_checkpoint(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    summary: dict,
+) -> None:
+    completed_blocks = int(summary["completed_blocks"])
+    if completed_blocks >= SESSION_GOAL_BLOCKS:
+        text = (
+            f"{format_session_summary(summary)}\n\n"
+            "Відпочити, продовжити чи закінчити?"
+        )
+    else:
+        text = (
+            f"{session_progress_line(completed_blocks)}\n"
+            f"🌿 Частину {completed_blocks} з {SESSION_GOAL_BLOCKS} завершено.\n"
+            "Продовжити чи трохи перепочити?"
+        )
+    await message.reply_text(
+        text,
+        reply_markup=active_session_keyboard(checkpoint=True),
+    )
+
+
 async def celebrate_correct(
     message,
     context: ContextTypes.DEFAULT_TYPE,
     earned_bonus: bool = False,
+    session_summary: dict | None = None,
 ) -> None:
     emoji = "⚡🌟" if earned_bonus else random.choice(CORRECT_EMOJIS)
     await message.reply_text(emoji)
+    if (
+        session_summary is not None
+        and session_summary.get("new_block_completed")
+    ):
+        await show_session_checkpoint(message, context, session_summary)
     await send_new_task(message, context, "Рухаємося далі:")
 
 
@@ -678,6 +992,18 @@ async def save_answer(
     answered_at = monotonic()
     started_at = context.user_data.get("task_started_at", answered_at)
     response_time_ms = max(0, round((answered_at - started_at) * 1000))
+    interval_started_at = context.user_data.get(
+        "session_interval_started_at",
+        started_at,
+    )
+    session_active_seconds = max(
+        0,
+        min(
+            SESSION_MAX_ANSWER_SECONDS,
+            round(answered_at - interval_started_at),
+        ),
+    )
+    context.user_data["session_interval_started_at"] = answered_at
     attempts = context.user_data.get("task_attempts", 0)
     first_attempt = attempts == 0
     context.user_data["task_attempts"] = attempts + 1
@@ -707,6 +1033,7 @@ async def save_answer(
                 first_attempt,
                 answered_at,
             )
+            event["session_active_seconds"] = session_active_seconds
             return is_correct, event
         except Exception:
             logging.exception(
@@ -734,6 +1061,7 @@ async def save_answer(
         first_attempt,
         answered_at,
     )
+    event["session_active_seconds"] = session_active_seconds
 
     return is_correct, event
 
@@ -773,6 +1101,7 @@ def update_warmup_state(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cancel_session_inactivity(context)
     await clear_bonus_reaction(context)
     await clear_interesting_offer(context)
     previous_answered_at = context.user_data.get(
@@ -802,7 +1131,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     await update.message.reply_text(
         "Почнімо! Розв’язуй у своєму темпі — кількість спроб не обмежена.\n"
-        "Обирай відповідь кнопкою. Якщо захочеш інший приклад, напиши /skip."
+        "Обирай відповідь кнопкою. Якщо захочеш інший приклад, напиши /skip.",
+        reply_markup=active_session_keyboard(),
     )
     await send_new_task(update.message, context)
 
@@ -836,10 +1166,8 @@ def clear_interesting_state(
         "interesting_prompt",
         "interesting_choices",
         "interesting_correct_answer",
-        "interesting_explanation",
         "interesting_started_at",
         "interesting_steps_remaining",
-        "interesting_correct_questions_by_concept",
     ):
         context.user_data.pop(key, None)
 
@@ -859,18 +1187,6 @@ def interesting_keyboard(
             for index, choice in enumerate(choices)
         ]
     )
-
-
-def interesting_answer_feedback(
-    is_correct: bool,
-    explanation: str,
-    concept_confirmed: bool,
-) -> str:
-    if is_correct and concept_confirmed:
-        return f"✅\n\n{explanation}"
-    if is_correct:
-        return "✅"
-    return "🤔"
 
 
 async def send_interesting_question(
@@ -900,9 +1216,6 @@ async def send_interesting_question(
     context.user_data["interesting_choices"] = choices
     context.user_data["interesting_correct_answer"] = question[
         "correct_answer"
-    ]
-    context.user_data["interesting_explanation"] = question[
-        "explanation"
     ]
 
     await message.reply_text(
@@ -946,9 +1259,6 @@ async def start_interesting_route(
     context.user_data["interesting_steps_remaining"] = (
         INTERESTING_ROUTE_MAX_STEPS
     )
-    context.user_data[
-        "interesting_correct_questions_by_concept"
-    ] = {}
     try:
         sent = await send_interesting_question(
             message,
@@ -990,7 +1300,6 @@ async def handle_interesting_answer(
         "interesting_correct_answer"
     ]
     is_correct = selected_answer == correct_answer
-    concept_id = context.user_data["interesting_concept_id"]
     started_at = context.user_data.get(
         "interesting_started_at",
         monotonic(),
@@ -1017,49 +1326,33 @@ async def handle_interesting_answer(
     context.user_data["interesting_steps_remaining"] = remaining
 
     next_question = None
-    next_lookup_failed = False
     try:
         next_question = await database.get_next_content_question(
             question_id,
             is_correct,
         )
     except Exception:
-        next_lookup_failed = True
         logging.exception("Could not load the next graph question")
 
-    correct_by_concept = context.user_data.setdefault(
-        "interesting_correct_questions_by_concept",
-        {},
-    )
-    correct_question_ids = correct_by_concept.setdefault(
-        concept_id,
-        set(),
-    )
-    if is_correct:
-        correct_question_ids.add(question_id)
-
-    has_harder_confirmation = (
-        is_correct
-        and next_question is not None
-        and next_question["concept_id"] == concept_id
-    )
-    concept_confirmed = (
-        is_correct
-        and len(correct_question_ids) >= 2
-        and not has_harder_confirmation
-        and not next_lookup_failed
-    )
-
-    explanation = context.user_data["interesting_explanation"]
-    feedback = interesting_answer_feedback(
-        is_correct,
-        explanation,
-        concept_confirmed,
+    session_summary = await track_session_activity(
+        query.from_user,
+        context,
+        query.message.chat_id,
+        min(
+            SESSION_MAX_ANSWER_SECONDS,
+            round(response_time_ms / 1_000),
+        ),
     )
     await query.edit_message_text(
-        f"✨ {context.user_data['interesting_prompt']}\n\n"
-        f"{feedback}"
+        f"✨ {context.user_data['interesting_prompt']}"
     )
+
+    if session_summary.get("new_block_completed"):
+        await show_session_checkpoint(
+            query.message,
+            context,
+            session_summary,
+        )
 
     if remaining > 0 and next_question is not None:
         await send_interesting_question(
@@ -1074,10 +1367,113 @@ async def handle_interesting_answer(
     await send_new_task(query.message, context)
 
 
+async def show_learning_progress(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    summary = None
+    try:
+        summary = await database.get_learning_summary(
+            update.effective_user.id
+        )
+    except Exception:
+        logging.exception("Could not load the learning-session summary")
+
+    if summary is None:
+        summary = {
+            "active_seconds": context.user_data.get(
+                "session_active_seconds", 0
+            ),
+            "focus_block_seconds": context.user_data.get(
+                "session_focus_block_seconds",
+                SESSION_DEFAULT_BLOCK_SECONDS,
+            ),
+            "completed_blocks": context.user_data.get(
+                "session_completed_blocks", 0
+            ),
+            "level_advances": context.user_data.get(
+                "session_level_advances", 0
+            ),
+        }
+
+    block_minutes = round(summary["focus_block_seconds"] / 60)
+    target_minutes = block_minutes * SESSION_GOAL_BLOCKS
+    await update.message.reply_text(
+        "🌿 Поточна сесія\n"
+        f"{session_progress_line(summary['completed_blocks'])}\n"
+        f"Активний час: {active_minutes_text(summary['active_seconds'])}\n"
+        f"М’яка мета: 3 × {block_minutes} хв = {target_minutes} хв",
+        reply_markup=(
+            active_session_keyboard()
+            if "answer" in context.user_data
+            else idle_session_keyboard()
+        ),
+    )
+
+
+async def stop_learning_session(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    reason: str,
+) -> None:
+    await clear_bonus_reaction(context)
+    await clear_interesting_offer(context)
+    clear_interesting_state(context)
+    summary = await end_current_session(
+        context,
+        update.effective_user.id,
+        reason,
+    )
+    await disable_current_task(context)
+    if summary is None:
+        text = "🌱 Сесію завершено"
+    else:
+        text = format_session_summary(summary)
+    if reason == "break":
+        text += "\n\n☕ Перепочинь. Повернутися можна будь-коли."
+    else:
+        text += "\n\nДо зустрічі 👋"
+    await update.message.reply_text(
+        text,
+        reply_markup=idle_session_keyboard(),
+    )
+
+
+async def continue_learning_session(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await set_session_keyboard(
+        context,
+        update.effective_chat.id,
+        active_session_keyboard(),
+    )
+    if "answer" in context.user_data:
+        await update.message.reply_text("▶️")
+        return
+    await send_new_task(update.message, context, "Продовжуємо:")
+
+
 async def handle_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     text = update.message.text.strip()
+
+    if text == PROGRESS_BUTTON_TEXT:
+        await show_learning_progress(update, context)
+        return
+
+    if text == CONTINUE_BUTTON_TEXT:
+        await continue_learning_session(update, context)
+        return
+
+    if text == REST_BUTTON_TEXT:
+        await stop_learning_session(update, context, "break")
+        return
+
+    if text == END_SESSION_BUTTON_TEXT:
+        await stop_learning_session(update, context, "finished")
+        return
 
     if "interesting_question_id" in context.user_data:
         await update.message.reply_text("Обери варіант кнопкою 😊")
@@ -1110,14 +1506,30 @@ async def handle_message(
     is_correct, event = await save_answer(
         update.effective_user, context, text
     )
+    session_summary = await track_session_activity(
+        update.effective_user,
+        context,
+        update.effective_chat.id,
+        event["session_active_seconds"],
+        event.get("level_change", 0) > 0,
+    )
 
     if is_correct:
         await celebrate_correct(
-            update.message, context, event["earned_bonus"]
+            update.message,
+            context,
+            event["earned_bonus"],
+            session_summary,
         )
         return
 
     await encourage_retry(update.message)
+    if session_summary.get("new_block_completed"):
+        await show_session_checkpoint(
+            update.message,
+            context,
+            session_summary,
+        )
     schedule_interesting_offer(context)
 
 
@@ -1140,11 +1552,21 @@ async def handle_answer_button(
     is_correct, event = await save_answer(
         query.from_user, context, selected_answer
     )
+    session_summary = await track_session_activity(
+        query.from_user,
+        context,
+        query.message.chat_id,
+        event["session_active_seconds"],
+        event.get("level_change", 0) > 0,
+    )
 
     if is_correct:
         await query.edit_message_reply_markup(reply_markup=None)
         await celebrate_correct(
-            query.message, context, event["earned_bonus"]
+            query.message,
+            context,
+            event["earned_bonus"],
+            session_summary,
         )
         return
 
@@ -1160,6 +1582,12 @@ async def handle_answer_button(
             task_id,
         ),
     )
+    if session_summary.get("new_block_completed"):
+        await show_session_checkpoint(
+            query.message,
+            context,
+            session_summary,
+        )
     schedule_interesting_offer(context)
 
 
