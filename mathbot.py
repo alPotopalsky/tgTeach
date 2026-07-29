@@ -143,6 +143,8 @@ PROGRESS_BUTTON_TEXT = "🌿 Мій прогрес"
 CONTINUE_BUTTON_TEXT = "▶️ Продовжити"
 REST_BUTTON_TEXT = "☕ Перепочити"
 END_SESSION_BUTTON_TEXT = "⏹ Закінчити"
+MORE_LIKE_THIS_BUTTON_TEXT = "✨ Ще подібне"
+SWITCH_CONTENT_BUTTON_TEXT = "🔄 Щось інше"
 INTERESTING_OFFER_MIN_SECONDS = 15
 INTERESTING_OFFER_MAX_SECONDS = 30
 INTERESTING_OFFER_WRONG_STEP_SECONDS = 3
@@ -163,6 +165,7 @@ def active_session_keyboard(
 ) -> ReplyKeyboardMarkup:
     if checkpoint:
         rows = [
+            [MORE_LIKE_THIS_BUTTON_TEXT, SWITCH_CONTENT_BUTTON_TEXT],
             [CONTINUE_BUTTON_TEXT, REST_BUTTON_TEXT],
             [END_SESSION_BUTTON_TEXT, PROGRESS_BUTTON_TEXT],
         ]
@@ -183,6 +186,112 @@ def idle_session_keyboard() -> ReplyKeyboardMarkup:
         [[CONTINUE_BUTTON_TEXT, PROGRESS_BUTTON_TEXT]],
         resize_keyboard=True,
         is_persistent=True,
+    )
+
+
+def preference_context(
+    subject: str,
+    topic: str,
+    concept_id: str | None = None,
+) -> dict[str, str | None]:
+    if concept_id:
+        content_key = f"concept:{concept_id}"
+    else:
+        content_key = f"topic:{subject}:{topic}"
+    return {
+        "content_key": content_key,
+        "subject": subject,
+        "topic": topic,
+        "concept_id": concept_id,
+    }
+
+
+def remember_content_interaction(
+    context: ContextTypes.DEFAULT_TYPE,
+    item: dict[str, str | None],
+) -> None:
+    counts = context.user_data.setdefault("session_content_counts", {})
+    content_key = str(item["content_key"])
+    current = counts.setdefault(
+        content_key,
+        {"count": 0, "context": item},
+    )
+    current["count"] += 1
+
+
+def dominant_session_content(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> dict[str, str | None] | None:
+    counts = context.user_data.get("session_content_counts", {})
+    if not counts:
+        return None
+    dominant = max(counts.values(), key=lambda item: item["count"])
+    context.user_data["session_content_counts"] = {}
+    return dominant["context"]
+
+
+def preference_offer_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    MORE_LIKE_THIS_BUTTON_TEXT,
+                    callback_data=f"pref:{token}:more",
+                ),
+                InlineKeyboardButton(
+                    SWITCH_CONTENT_BUTTON_TEXT,
+                    callback_data=f"pref:{token}:switch",
+                ),
+            ]
+        ]
+    )
+
+
+async def apply_content_preference(
+    user,
+    context: ContextTypes.DEFAULT_TYPE,
+    item: dict[str, str | None],
+    action: str,
+) -> None:
+    if action == "more":
+        context.user_data["preference_boost"] = {
+            **item,
+            "remaining": 4,
+        }
+    else:
+        switched_keys = context.user_data.setdefault(
+            "session_switched_keys",
+            set(),
+        )
+        switched_keys.add(item["content_key"])
+        boost = context.user_data.get("preference_boost")
+        if boost and boost["content_key"] == item["content_key"]:
+            context.user_data.pop("preference_boost", None)
+
+    try:
+        await database.record_content_preference(
+            user=user,
+            content_key=str(item["content_key"]),
+            subject=str(item["subject"]),
+            topic=str(item["topic"]),
+            concept_id=item.get("concept_id"),
+            action=action,
+        )
+    except Exception:
+        logging.exception("Could not save the content preference")
+
+
+async def show_preference_offer(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    item: dict[str, str | None],
+) -> None:
+    token = f"{random.getrandbits(32):08x}"
+    context.user_data["preference_offer_token"] = token
+    context.user_data["preference_offer_context"] = item
+    await message.reply_text(
+        "Що далі?",
+        reply_markup=preference_offer_keyboard(token),
     )
 
 
@@ -541,6 +650,32 @@ def set_new_task(
     english_interval = max(3, 5 - min((english_level - 1) // 3, 2))
     math_modes = math_modes_for_level(math_level - 1)
     prefer_english = task_number % english_interval == 0
+    switched_keys = context.user_data.get("session_switched_keys", set())
+    boost = context.user_data.get("preference_boost")
+    if boost and boost["content_key"] not in switched_keys:
+        prefer_english = boost["subject"] == "english"
+        if boost["subject"] == "math":
+            preferred_modes = [
+                mode
+                for mode in math_modes
+                if MATH_TOPIC_BY_MODE.get(mode) == boost["topic"]
+            ]
+            if preferred_modes:
+                math_modes = preferred_modes
+
+    english_key = f"topic:english:{ENGLISH_WORDS_TOPIC}"
+    if english_key in switched_keys:
+        prefer_english = False
+    available_math_modes = [
+        mode
+        for mode in math_modes
+        if (
+            f"topic:math:{MATH_TOPIC_BY_MODE.get(mode)}"
+            not in switched_keys
+        )
+    ]
+    if available_math_modes:
+        math_modes = available_math_modes
 
     if prefer_english:
         choice_count = min(3 + (english_level - 1) // 3, 6)
@@ -567,6 +702,12 @@ def set_new_task(
         subject = "math"
         task_level = math_level
         subject_progress = math_progress
+
+    selected_key = f"topic:{subject}:{topic}"
+    if boost and boost["content_key"] == selected_key:
+        boost["remaining"] -= 1
+        if boost["remaining"] <= 0:
+            context.user_data.pop("preference_boost", None)
 
     context.user_data["answer"] = answer.casefold()
     context.user_data["task_id"] = task_id
@@ -826,6 +967,10 @@ async def end_current_session(
         "session_focus_block_seconds",
         "session_completed_blocks",
         "session_level_advances",
+        "session_switched_keys",
+        "session_content_counts",
+        "preference_context",
+        "preference_boost",
     ):
         context.user_data.pop(key, None)
     return summary
@@ -944,6 +1089,9 @@ async def show_session_checkpoint(
     summary: dict,
 ) -> None:
     completed_blocks = int(summary["completed_blocks"])
+    context.user_data["preference_context"] = dominant_session_content(
+        context
+    )
     if completed_blocks >= SESSION_GOAL_BLOCKS:
         text = (
             f"{format_session_summary(summary)}\n\n"
@@ -1162,12 +1310,15 @@ def clear_interesting_state(
     for key in (
         "interesting_question_id",
         "interesting_concept_id",
+        "interesting_subject",
+        "interesting_topic",
         "interesting_callback_token",
         "interesting_prompt",
         "interesting_choices",
         "interesting_correct_answer",
         "interesting_started_at",
         "interesting_steps_remaining",
+        "interesting_route_context",
     ):
         context.user_data.pop(key, None)
 
@@ -1211,6 +1362,8 @@ async def send_interesting_question(
     context.user_data["interesting_concept_id"] = question[
         "concept_id"
     ]
+    context.user_data["interesting_subject"] = question["subject"]
+    context.user_data["interesting_topic"] = question["topic"]
     context.user_data["interesting_callback_token"] = callback_token
     context.user_data["interesting_prompt"] = question["prompt"]
     context.user_data["interesting_choices"] = choices
@@ -1272,6 +1425,14 @@ async def start_interesting_route(
     if not sent:
         clear_interesting_state(context)
         await send_new_task(message, context)
+    else:
+        context.user_data["interesting_route_context"] = (
+            preference_context(
+                context.user_data["interesting_subject"],
+                context.user_data["interesting_topic"],
+                context.user_data["interesting_concept_id"],
+            )
+        )
 
 
 async def handle_interesting_answer(
@@ -1320,6 +1481,15 @@ async def handle_interesting_answer(
     except Exception:
         logging.exception("Could not save an interesting answer")
 
+    remember_content_interaction(
+        context,
+        preference_context(
+            context.user_data["interesting_subject"],
+            context.user_data["interesting_topic"],
+            context.user_data["interesting_concept_id"],
+        ),
+    )
+
     remaining = (
         context.user_data.get("interesting_steps_remaining", 1) - 1
     )
@@ -1363,8 +1533,78 @@ async def handle_interesting_answer(
         context.user_data["interesting_steps_remaining"] = remaining
         return
 
+    route_context = context.user_data.pop(
+        "interesting_route_context",
+        None,
+    )
     clear_interesting_state(context)
+    if route_context is not None:
+        await show_preference_offer(
+            query.message,
+            context,
+            route_context,
+        )
     await send_new_task(query.message, context)
+
+
+async def handle_preference_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    _, token, action = query.data.split(":", 2)
+    if token != context.user_data.get("preference_offer_token"):
+        await query.answer("Цей вибір уже враховано")
+        return
+
+    item = context.user_data.pop("preference_offer_context", None)
+    context.user_data.pop("preference_offer_token", None)
+    if item is None:
+        await query.answer("Цей вибір уже недоступний")
+        return
+
+    await query.answer()
+    await apply_content_preference(
+        query.from_user,
+        context,
+        item,
+        action,
+    )
+    await query.edit_message_text(
+        "✨ Додам схожого" if action == "more" else "🔄 Змінимо напрям"
+    )
+
+
+async def handle_preference_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+) -> None:
+    item = context.user_data.pop("preference_context", None)
+    if item is None:
+        await update.message.reply_text(
+            "Спочатку пройдемо ще невелику частину 🌱"
+        )
+        return
+    await apply_content_preference(
+        update.effective_user,
+        context,
+        item,
+        action,
+    )
+    await update.message.reply_text(
+        "✨ Додам схожого" if action == "more" else "🔄 Змінимо напрям",
+        reply_markup=active_session_keyboard(),
+    )
+    if action == "switch" and "answer" in context.user_data:
+        await clear_bonus_reaction(context)
+        await clear_interesting_offer(context)
+        await disable_current_task(context)
+        await send_new_task(
+            update.message,
+            context,
+            "Спробуймо інший напрям:",
+        )
 
 
 async def show_learning_progress(
@@ -1475,6 +1715,14 @@ async def handle_message(
         await stop_learning_session(update, context, "finished")
         return
 
+    if text == MORE_LIKE_THIS_BUTTON_TEXT:
+        await handle_preference_message(update, context, "more")
+        return
+
+    if text == SWITCH_CONTENT_BUTTON_TEXT:
+        await handle_preference_message(update, context, "switch")
+        return
+
     if "interesting_question_id" in context.user_data:
         await update.message.reply_text("Обери варіант кнопкою 😊")
         return
@@ -1506,6 +1754,14 @@ async def handle_message(
     is_correct, event = await save_answer(
         update.effective_user, context, text
     )
+    if event.get("affects_progress"):
+        remember_content_interaction(
+            context,
+            preference_context(
+                context.user_data["task_type"],
+                context.user_data["task_topic"],
+            ),
+        )
     session_summary = await track_session_activity(
         update.effective_user,
         context,
@@ -1552,6 +1808,14 @@ async def handle_answer_button(
     is_correct, event = await save_answer(
         query.from_user, context, selected_answer
     )
+    if event.get("affects_progress"):
+        remember_content_interaction(
+            context,
+            preference_context(
+                context.user_data["task_type"],
+                context.user_data["task_topic"],
+            ),
+        )
     session_summary = await track_session_activity(
         query.from_user,
         context,
@@ -1612,6 +1876,12 @@ def main() -> None:
         CallbackQueryHandler(
             handle_interesting_answer,
             pattern=r"^iq:",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            handle_preference_button,
+            pattern=r"^pref:",
         )
     )
     app.add_handler(

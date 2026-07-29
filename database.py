@@ -165,6 +165,27 @@ MAIN_SCHEMA = [
     CREATE INDEX IF NOT EXISTS learning_sessions_user_time_idx
     ON learning_sessions (telegram_user_id, started_at DESC)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS user_content_preferences (
+        telegram_user_id BIGINT NOT NULL
+            REFERENCES bot_users (telegram_user_id) ON DELETE CASCADE,
+        content_key TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        concept_id TEXT,
+        preference_score SMALLINT NOT NULL DEFAULT 0
+            CHECK (preference_score BETWEEN -5 AND 5),
+        more_signals INTEGER NOT NULL DEFAULT 0,
+        switch_signals INTEGER NOT NULL DEFAULT 0,
+        last_action TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (telegram_user_id, content_key)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS user_content_preferences_recent_idx
+    ON user_content_preferences (telegram_user_id, updated_at DESC)
+    """,
 ]
 
 LOG_SCHEMA = [
@@ -955,13 +976,26 @@ async def get_content_question(
                 LEFT JOIN user_question_progress AS p
                     ON p.question_id = q.question_id
                    AND p.telegram_user_id = %s
+                LEFT JOIN user_content_preferences AS preference
+                    ON preference.telegram_user_id = %s
+                   AND preference.content_key = CASE
+                        WHEN q.concept_id IS NOT NULL
+                            THEN 'concept:' || q.concept_id
+                        ELSE 'topic:' || q.subject || ':' || q.topic
+                   END
                 WHERE q.active AND q.is_entry
                 ORDER BY
+                    CASE
+                        WHEN preference.updated_at
+                            > NOW() - INTERVAL '7 days'
+                        THEN preference.preference_score
+                        ELSE 0
+                    END DESC NULLS LAST,
                     p.last_answered_at ASC NULLS FIRST,
                     RANDOM()
                 LIMIT 1
                 """,
-                (user_id,),
+                (user_id, user_id),
             )
         row = await cursor.fetchone()
 
@@ -1393,6 +1427,74 @@ async def get_learning_summary(user_id: int) -> dict[str, Any] | None:
         "completed_blocks": int(session_row[2]),
         "level_advances": int(session_row[3]),
     }
+
+
+async def record_content_preference(
+    *,
+    user: Any,
+    content_key: str,
+    subject: str,
+    topic: str,
+    concept_id: str | None,
+    action: str,
+) -> None:
+    if _progress_pool is None:
+        return
+    if action not in {"more", "switch"}:
+        raise ValueError("Unknown content preference action")
+
+    score_delta = 1 if action == "more" else -1
+    async with _progress_pool.connection() as connection:
+        async with connection.transaction():
+            await _upsert_user(connection, user)
+            await connection.execute(
+                """
+                INSERT INTO user_content_preferences (
+                    telegram_user_id,
+                    content_key,
+                    subject,
+                    topic,
+                    concept_id,
+                    preference_score,
+                    more_signals,
+                    switch_signals,
+                    last_action
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (telegram_user_id, content_key)
+                DO UPDATE SET
+                    subject = EXCLUDED.subject,
+                    topic = EXCLUDED.topic,
+                    concept_id = EXCLUDED.concept_id,
+                    preference_score = LEAST(
+                        5,
+                        GREATEST(
+                            -5,
+                            user_content_preferences.preference_score
+                            + EXCLUDED.preference_score
+                        )
+                    ),
+                    more_signals =
+                        user_content_preferences.more_signals
+                        + EXCLUDED.more_signals,
+                    switch_signals =
+                        user_content_preferences.switch_signals
+                        + EXCLUDED.switch_signals,
+                    last_action = EXCLUDED.last_action,
+                    updated_at = NOW()
+                """,
+                (
+                    user.id,
+                    content_key,
+                    subject,
+                    topic,
+                    concept_id,
+                    score_delta,
+                    int(action == "more"),
+                    int(action == "switch"),
+                    action,
+                ),
+            )
 
 
 async def block_topic(
